@@ -62,6 +62,11 @@ class ReleaseArcOrchestrator:
         gatekeeper_model: str = "gemini/gemini-3.1-pro-preview"
     ):
         self.target_repo = target_repo
+        # Centralized metadata storage
+        self.project_name = os.path.basename(self.target_repo.rstrip("/"))
+        self.metadata_dir = f"metadata/{self.project_name}"
+        os.makedirs(self.metadata_dir, exist_ok=True)
+        
         self.guidelines = guidelines or "Follow professional best practices."
         self.supervisor = SupervisorAgent(model_id=supervisor_model)
         self.worker = WorkerAgent(model_id=worker_model)
@@ -82,12 +87,23 @@ class ReleaseArcOrchestrator:
             content = sandbox.read_file(doc)
             if "[File does not exist]" not in content and len(content.strip()) > 0:
                 docs_content.append(f"--- FILE: {doc} ---\n{content[:2000]}")
+        
         repowise_out, _ = await asyncio.to_thread(sandbox.execute_command, "find . -name '*repowise*' -type f -maxdepth 4 2>/dev/null")
         if repowise_out.strip():
             for rw_file in repowise_out.strip().split("\n")[:3]:
                 rw_content = sandbox.read_file(rw_file)
                 if "[File does not exist]" not in rw_content:
                     docs_content.append(f"--- REPOWISE: {rw_file} ---\n{rw_content[:3000]}")
+
+        # 5. HUMAN RULINGS & PROJECT SOPs (Context Priming)
+        # Read from centralized metadata storage
+        rulings_local_path = f"{self.metadata_dir}/RULINGS.md"
+        if os.path.exists(rulings_local_path):
+            with open(rulings_local_path, "r") as f:
+                rulings_content = f.read()
+            if rulings_content.strip():
+                docs_content.append(f"\n--- HUMAN RULINGS & PROJECT SOPs ---\n{rulings_content}")
+
         full_context = f"REPOSITORY STRUCTURE:\n{structure_out}\n\nSYMBOL MAP:\n{repo_map_out}\n\nCRITICAL DOCUMENTATION:\n" + "\n".join(docs_content)
         return full_context
 
@@ -112,7 +128,7 @@ class ReleaseArcOrchestrator:
                     new_content = new_content.replace(search, replace)
                 else:
                     logger.error("SEARCH block match failed", search_preview=search[:50])
-                    raise ValueError(f"Surgical patch failed: Could not find exact match for SEARCH block in the file. Ensure whitespace and indentation match exactly.")
+                    raise ValueError(f"Surgical patch failed: Could not find exact match for SEARCH block in the file.")
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
@@ -167,27 +183,65 @@ class ReleaseArcOrchestrator:
                 print("📋 Using manual override plan.")
                 plan = manual_plan
             else:
-                print("🏗️  The Architect is decomposing the requirements into a plan...")
-                plan_result = await self.supervisor.invoke(context, issue_description)
-                if not plan_result.success: return False
-                plan = plan_result.output
+                # TIER 1: PLANNING PHASE
+                plan_file = f"{self.metadata_dir}/PLAN_{issue_id}.md"
                 
-                max_revisions = 3
-                for attempt in range(max_revisions + 1):
-                    print(f"🛡️  The Gatekeeper is reviewing the plan (Attempt {attempt+1})...")
-                    plan_gate = await self.gatekeeper.review_plan(issue_description, plan)
-                    await self._log_gate(db, arc_id, None, "review_plan", plan_gate.approved, plan_gate.critique, error_type=plan_gate.error_type, attempt=attempt+1, metrics=plan_gate.metrics)
-                    if plan_gate.approved:
-                        print("✅ Plan approved.")
-                        break
-                    if attempt < max_revisions:
-                        print(f"❌ Plan rejected: {plan_gate.error_type}. The Architect is revising...")
-                        revision_result = await self.supervisor.revise_plan(plan, plan_gate.critique, context)
-                        if not revision_result.success: return False
-                        plan = revision_result.output
-                    else:
-                        print("🚫 Plan failed final review.")
-                        return False
+                # Check if an approved plan already exists
+                if os.path.exists(plan_file):
+                    print(f"📄 Found existing plan for {issue_id}. Loading...")
+                    with open(plan_file, "r") as f:
+                        plan_json = f.read()
+                    try:
+                        # Find the JSON block in the markdown
+                        json_str = plan_json.split("```json")[1].split("```")[0].strip()
+                        plan_data = json.loads(json_str)
+                        plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])
+                    except Exception as e:
+                        logger.error("Failed to parse existing plan file. Generating new one.", error=str(e))
+                        plan = None
+                
+                if not plan:
+                    print("🏗️  The Architect is decomposing the requirements into a draft plan...")
+                    plan_result = await self.supervisor.invoke(context, issue_description)
+                    if not plan_result.success: return False
+                    plan = plan_result.output
+                    
+                    max_revisions = 3
+                    for attempt in range(max_revisions + 1):
+                        print(f"🛡️  The Gatekeeper is reviewing the draft plan (Attempt {attempt+1})...")
+                        plan_gate = await self.gatekeeper.review_plan(issue_description, plan)
+                        await self._log_gate(db, arc_id, None, "review_plan", plan_gate.approved, plan_gate.critique, error_type=plan_gate.error_type, attempt=attempt+1, metrics=plan_gate.metrics)
+                        if plan_gate.approved:
+                            print("✅ Draft Plan approved by Gatekeeper.")
+                            break
+                        if attempt < max_revisions:
+                            print(f"❌ Plan rejected: {plan_gate.error_type}. The Architect is revising...")
+                            revision_result = await self.supervisor.revise_plan(plan, plan_gate.critique, context)
+                            if not revision_result.success: return False
+                            plan = revision_result.output
+                        else:
+                            print("🚫 Plan failed final review.")
+                            return False
+
+                    # Save the plan to disk for human review
+                    os.makedirs(os.path.dirname(plan_file), exist_ok=True)
+                    with open(plan_file, "w") as f:
+                        f.write(f"# Implementation Plan for {issue_id}\n\n")
+                        f.write("## Original Requirement\n")
+                        f.write(f"{issue_description}\n\n")
+                        f.write("## Execution Tasks\n")
+                        f.write("Review this plan. If correct, run the pipeline again to execute. If incorrect, edit the JSON below.\n\n")
+                        f.write("```json\n")
+                        f.write(json.dumps([t.dict() for t in plan.tasks], indent=2))
+                        f.write("\n```\n")
+                    
+                    print("\n" + "="*60)
+                    print(f"🛑 PLANNING PAUSE: Draft plan saved to {plan_file}")
+                    print("1. Please open the file and review the tasks.")
+                    print("2. Make any manual edits to the JSON block if the AI hallucinated.")
+                    print("3. Run the pipeline again to begin Tier 3 execution.")
+                    print("="*60 + "\n")
+                    return True # Stop execution here for human review
 
             all_diffs = []
             task_memory = "" # PERSISTENT CONTEXT FOR THE WHOLE ARC
@@ -236,6 +290,10 @@ class ReleaseArcOrchestrator:
                 while task_attempt < max_task_attempts:
                     task_attempt += 1
                     
+                    # GIT ROLLBACK: Ensure pristine state for each attempt
+                    print(f"🧹 Resetting workspace to pristine state...")
+                    await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, "git reset --hard HEAD && git clean -fd")
+
                     # Strike-Two Breakout: Ask human for hint after 2 fails
                     if task_attempt == 3 and not task_success:
                         print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: The AI is stuck on {task.id}\nCRITIQUE: {last_error_feedback[:300]}\n" + "!"*60)
@@ -245,8 +303,14 @@ class ReleaseArcOrchestrator:
                             break
                         elif user_hint:
                             current_task_desc += f"\n\nSTRATEGIC HINT: {user_hint}"
+                            # PERSISTENT LEARNING: Save rule to RULINGS.md
+                            rulings_path = f"{self.metadata_dir}/RULINGS.md"
+                            with open(rulings_path, "a") as rf:
+                                rf.write(f"\n- **Rule from {task.id}**: {user_hint}\n")
+                            print("🧠 Hint permanently saved to Project Rulings.")
 
-                    print(f"🔨 The Engineer is working on {task.id} (Attempt {task_attempt})...")
+                        print(f"🔨 The Engineer is working on {task.id} (Attempt {task_attempt})...")
+
                     mission_desc = current_task_desc
                     if task_attempt > 1:
                         print(f"🔄 Retrying {task.id} with self-healing feedback...")
@@ -258,12 +322,12 @@ class ReleaseArcOrchestrator:
                         print(f"⚠️  Design check failed for {task.id}. Self-healing...")
                         continue
                     
-                    # TEMPERATURE ESCALATION: Increase creativity on retries (0.3 -> 0.5 -> 0.7)
+                    # TEMPERATURE ESCALATION
                     retry_temp = 0.3 + (task_attempt - 1) * 0.2
                     worker_res = await self.worker.invoke(context, temp_task, temperature=retry_temp)
                     w_output: WorkerResult = worker_res.output
                     
-                    # TASK MEMORY: Capture analysis for future tasks
+                    # TASK MEMORY
                     if not task.target_file:
                         task_memory += f"\n--- PERSISTENT ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
                     context["task_memory"] = task_memory
@@ -282,8 +346,6 @@ class ReleaseArcOrchestrator:
                                 filepath = f"{self.target_repo}/{task.target_file}"
                                 print(f"💾 Pre-flight staging: {task.target_file}...")
                                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                                
-                                # Read current content
                                 existing_content = ""
                                 if os.path.exists(filepath):
                                     with open(filepath, "r") as f: existing_content = f.read()
@@ -337,7 +399,7 @@ class ReleaseArcOrchestrator:
                             await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
                             await db.commit()
                             
-                            # GIT CHECKPOINT: Commit successfully completed task (LOCAL ONLY)
+                            # GIT CHECKPOINT (LOCAL ONLY)
                             print(f"📦 Creating local Git checkpoint for {task.id}...")
                             checkpoint_cmd = f"git add . && git commit -m 'GATE Checkpoint: {task.id} - {task.description[:50]}'"
                             await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, checkpoint_cmd)
@@ -384,7 +446,7 @@ class ReleaseArcOrchestrator:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt, verification_method, prompt_t, comp_t)
             )
-        except Exception as e:
+        except Exception:
              await db.execute(
                 """INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -416,7 +478,7 @@ if __name__ == "__main__":
                 if task is not asyncio.current_task(): task.cancel()
             try:
                 await asyncio.wait_for(asyncio.gather(*[p for p in pending if p is not asyncio.current_task()], return_exceptions=True), timeout=2.0)
-            except: pass
+            except Exception: pass
             loop = asyncio.get_event_loop()
             await loop.shutdown_asyncgens()
             print("✨ Resources released.")

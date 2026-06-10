@@ -13,6 +13,8 @@ class TaskDefinition(BaseModel):
     description: str
     target_file: Optional[str] = None
     dependencies: List[str] = []
+    design_constraints: str = "Follow project guidelines."
+    acceptance_criteria: str = "Code compiles and passes linting."
 
 class SupervisorPlan(BaseModel):
     tasks: List[TaskDefinition]

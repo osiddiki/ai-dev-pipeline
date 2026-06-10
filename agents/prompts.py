@@ -58,8 +58,10 @@ DO NOT include 'Design Review', 'Final Review', or 'Verification/Testing' tasks 
 If you add a task like "Verify X exists," the Worker will have nothing to do and the pipeline will fail.
 
 OUTPUT FORMAT:
-Return ONLY a JSON list of tasks with 'id', 'description', 'target_file', and 'dependencies'. 
-Example: [{{"id": "task_1", "description": "Update headers", "target_file": "src/main.py", "dependencies": []}}]
+Return ONLY a JSON list of tasks with 'id', 'description', 'target_file', 'dependencies', 'design_constraints', and 'acceptance_criteria'.
+'design_constraints' MUST explain exactly HOW the code should be structured.
+'acceptance_criteria' MUST explain exactly HOW to prove the task is complete.
+Example: [{"id": "task_1", "description": "Create utils.ts", "target_file": "src/utils.ts", "dependencies": [], "design_constraints": "Use pure functions and named exports", "acceptance_criteria": "File exists and exports a parse function"}]
 """
 
 
@@ -160,9 +162,10 @@ Output a JSON verification plan.
 
 CRITICAL RULES:
 1. CONSERVATIVE TESTING: For initialization tasks (creating package.json, tsconfig.json, or new directories), DO NOT run heavy commands like 'npm install' or 'npm build'. Instead, use simple existence checks (e.g., 'test -f path/to/file').
-2. SUB-DIRECTORY AWARENESS: Always include the full path in your commands or use 'cd folder && command'.
-3. NO USER PROMPTS: NEVER suggest user interaction.
-4. FALLBACK: If no heavy test is appropriate, default to 'syntax_check'.
+2. ANALYSIS TASKS: If the task is purely an "Analysis" or "Design Review" task (no files are being modified or created), you MUST set fallback_mode to 'fail' and provide an empty commands list. You cannot test an analysis document.
+3. SUB-DIRECTORY AWARENESS: Always include the full path in your commands or use 'cd folder && command'.
+4. NO USER PROMPTS: NEVER suggest user interaction.
+5. FALLBACK: If no heavy test is appropriate, default to 'syntax_check'.
 
 OUTPUT FORMAT:
 Return ONLY a JSON object:
