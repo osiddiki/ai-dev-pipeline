@@ -3,3 +3,20 @@
 *.db
 __pycache__/
 *.pyc
+*.log
+.DS_Store
+
+# GATE Pipeline State & Private Work
+metadata/
+.gate/
+working_documents/
+
+# Temporary / Scratch Files
+test_api.py
+test_gemini.py
+list_models.py
+test_docker_conn.py
+test_gemini_key.py
+test_deepseek_key.py
+list_gemini_models.py
+list_gemini_models_simple.py
