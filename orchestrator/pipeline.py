@@ -260,56 +260,60 @@ class ReleaseArcOrchestrator:
                 retry_temp = 0.3 + (task_attempt - 1) * 0.2
                 
                 worker_res = await self.worker.invoke(context, temp_task, temperature=retry_temp)
- # We need to update Worker to accept temp
-                    w_output: WorkerResult = worker_res.output
-                    
-                    if not task.target_file:
-                        task_memory += f"\n--- PERSISTENT ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
-                    context["task_memory"] = task_memory
-                    
-                    print(f"🛡️  The Gatekeeper is performing code review...")
-                    cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
-                    
-                    verification_method_used = None
-                    if cr_gate.approved:
-                        if task.target_file:
-                            PROTECTED_PATHS = ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"]
-                            if any(p in task.target_file for p in PROTECTED_PATHS):
-                                print(f"🛑 SOURCE GUARD BLOCKED WRITE: {task.target_file}")
-                            else:
-                                filepath = f"{self.target_repo}/{task.target_file}"
-                                print(f"💾 Staging changes to {task.target_file}...")
-                                os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                                existing_content = ""
-                                if os.path.exists(filepath):
-                                    with open(filepath, "r") as f: existing_content = f.read()
-                                try:
-                                    updated_content = self.apply_patches(existing_content, w_output.diff)
-                                    with open(filepath, "w") as f: f.write(updated_content)
-                                except Exception as e:
-                                    last_error_feedback = f"Patching failed: {str(e)}"
-                                    print(f"❌ Patching failed: {str(e)}")
-                                    cr_gate.approved = False
-                                    continue
-
-                        print(f"🧪 Running autonomous reality check...")
-                        verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
-                        changed_files = [task.target_file] if task.target_file else []
-                        verification = await verifier.verify(temp_task.description, repo_context, changed_files)
-                        
-                        if not verification.success:
-                            print(f"❌ Reality check failed: {verification.reason}")
-                            cr_gate.approved = False
-                            cr_gate.error_type = "systematic"
-                            cr_gate.critique += f"\n\nEMPIRICAL FAILURE:\n{verification.reason}"
-                            last_error_feedback = cr_gate.critique
+                w_output: WorkerResult = worker_res.output
+                
+                # TASK MEMORY: Capture analysis for future tasks
+                if not task.target_file:
+                    task_memory += f"\n--- PERSISTENT ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
+                context["task_memory"] = task_memory
+                
+                print(f"🛡️  The Gatekeeper is performing code review...")
+                cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
+                
+                verification_method_used = None
+                if cr_gate.approved:
+                    # STAGE THE CHANGE (Write to disk so verification can see it)
+                    if task.target_file:
+                        PROTECTED_PATHS = ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"]
+                        if any(p in task.target_file for p in PROTECTED_PATHS):
+                            print(f"🛑 SOURCE GUARD BLOCKED WRITE: {task.target_file}")
                         else:
-                            print(f"✨ Task {task.id} passed all gates.")
-                            all_diffs.append(w_output)
-                            await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
-                            await db.commit()
-                            task_success = True
-                            break
+                            filepath = f"{self.target_repo}/{task.target_file}"
+                            print(f"💾 Staging changes to {task.target_file}...")
+                            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                            existing_content = ""
+                            if os.path.exists(filepath):
+                                with open(filepath, "r") as f: existing_content = f.read()
+                            try:
+                                updated_content = self.apply_patches(existing_content, w_output.diff)
+                                with open(filepath, "w") as f: f.write(updated_content)
+                            except Exception as e:
+                                logger.error("Patching failed during staging", error=str(e))
+                                last_error_feedback = f"Patching failed: {str(e)}"
+                                cr_gate.approved = False
+                                continue
+
+                    # EMPIRICAL VERIFICATION (Now runs against the staged file)
+                    logger.info("Running autonomous empirical verification", task_id=temp_task.id)
+                    sandbox = DockerSandbox(self.target_repo)
+                    verifier = VerifierEngine(sandbox=sandbox)
+                    
+                    changed_files = [task.target_file] if task.target_file else []
+                    verification = await verifier.verify(temp_task.description, repo_context, changed_files)
+                    
+                    if not verification.success:
+                        print(f"❌ Reality check failed: {verification.reason}")
+                        cr_gate.approved = False
+                        cr_gate.error_type = "systematic"
+                        cr_gate.critique += f"\n\nEMPIRICAL FAILURE:\n{verification.reason}"
+                        last_error_feedback = cr_gate.critique
+                    else:
+                        print(f"✨ Task {task.id} passed all gates.")
+                        all_diffs.append(w_output)
+                        await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
+                        await db.commit()
+                        task_success = True
+                        break
 
                     await self._log_gate(db, arc_id, task.id, "codereview", cr_gate.approved, cr_gate.critique, error_type=cr_gate.error_type, attempt=task_attempt, verification_method=verification_method_used, metrics=cr_gate.metrics)
                     
