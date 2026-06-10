@@ -112,7 +112,7 @@ class ReleaseArcOrchestrator:
                     new_content = new_content.replace(search, replace)
                 else:
                     logger.error("SEARCH block match failed", search_preview=search[:50])
-                    raise ValueError(f"Surgical patch failed: Could not find exact match for SEARCH block in the file.")
+                    raise ValueError(f"Surgical patch failed: Could not find exact match for SEARCH block in the file. Ensure whitespace and indentation match exactly.")
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
@@ -224,96 +224,126 @@ class ReleaseArcOrchestrator:
                         print(f"⏭️  Skipping completed task: {task.id}")
                         continue
 
-            max_task_attempts = 3
-            task_attempt = 0
-            task_success = False
-            last_error_feedback = ""
-            current_task_desc = task.description
+                max_task_attempts = 3
+                task_attempt = 0
+                task_success = False
+                last_error_feedback = ""
+                current_task_desc = task.description
 
-            await db.execute("INSERT INTO tasks (arc_id, description, status) VALUES (?, ?, 'in_progress')", (arc_id, task.description))
-            await db.commit()
+                await db.execute("INSERT INTO tasks (arc_id, description, status) VALUES (?, ?, 'in_progress')", (arc_id, task.description))
+                await db.commit()
 
-            while task_attempt < max_task_attempts:
-                task_attempt += 1
-                
-                # Strike-Two Breakout: Ask human for hint after 2 fails
-                if task_attempt == 3 and not task_success:
-                    print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: The AI is stuck on {task.id}\nCRITIQUE: {last_error_feedback[:300]}\n" + "!"*60)
-                    user_hint = input("\nProvide a strategic hint to break the loop, or type 'skip': ").strip()
-                    if user_hint.lower() == 'skip':
-                        task_success = True
-                        break
-                    elif user_hint:
-                        current_task_desc += f"\n\nSTRATEGIC HINT: {user_hint}"
+                while task_attempt < max_task_attempts:
+                    task_attempt += 1
+                    
+                    # Strike-Two Breakout: Ask human for hint after 2 fails
+                    if task_attempt == 3 and not task_success:
+                        print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: The AI is stuck on {task.id}\nCRITIQUE: {last_error_feedback[:300]}\n" + "!"*60)
+                        user_hint = input("\nProvide a strategic hint to break the loop, or type 'skip': ").strip()
+                        if user_hint.lower() == 'skip':
+                            task_success = True
+                            break
+                        elif user_hint:
+                            current_task_desc += f"\n\nSTRATEGIC HINT: {user_hint}"
 
-                print(f"🔨 The Engineer is working on {task.id} (Attempt {task_attempt})...")
-                mission_desc = current_task_desc
-                if task_attempt > 1:
-                    print(f"🔄 Retrying {task.id} with self-healing feedback...")
-                    mission_desc += f"\n\nPREVIOUS FAILURE FEEDBACK:\n{last_error_feedback}"
-                
-                temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies)
-                design_gate = await self.gatekeeper.review_design(temp_task, f"Design for {temp_task.id}")
-                if not design_gate.approved: continue
-                
-                # TEMPERATURE ESCALATION: Increase creativity on retries (0.3 -> 0.5 -> 0.7)
-                retry_temp = 0.3 + (task_attempt - 1) * 0.2
-                
-                worker_res = await self.worker.invoke(context, temp_task, temperature=retry_temp)
-                w_output: WorkerResult = worker_res.output
-                
-                # TASK MEMORY: Capture analysis for future tasks
-                if not task.target_file:
-                    task_memory += f"\n--- PERSISTENT ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
-                context["task_memory"] = task_memory
-                
-                print(f"🛡️  The Gatekeeper is performing code review...")
-                cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
-                
-                verification_method_used = None
-                if cr_gate.approved:
-                    # STAGE THE CHANGE (Write to disk so verification can see it)
-                    if task.target_file:
-                        PROTECTED_PATHS = ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"]
-                        if any(p in task.target_file for p in PROTECTED_PATHS):
-                            print(f"🛑 SOURCE GUARD BLOCKED WRITE: {task.target_file}")
+                    print(f"🔨 The Engineer is working on {task.id} (Attempt {task_attempt})...")
+                    mission_desc = current_task_desc
+                    if task_attempt > 1:
+                        print(f"🔄 Retrying {task.id} with self-healing feedback...")
+                        mission_desc += f"\n\nPREVIOUS FAILURE FEEDBACK:\n{last_error_feedback}"
+                    
+                    temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies)
+                    design_gate = await self.gatekeeper.review_design(temp_task, f"Design for {temp_task.id}")
+                    if not design_gate.approved: 
+                        print(f"⚠️  Design check failed for {task.id}. Self-healing...")
+                        continue
+                    
+                    # TEMPERATURE ESCALATION: Increase creativity on retries (0.3 -> 0.5 -> 0.7)
+                    retry_temp = 0.3 + (task_attempt - 1) * 0.2
+                    worker_res = await self.worker.invoke(context, temp_task, temperature=retry_temp)
+                    w_output: WorkerResult = worker_res.output
+                    
+                    # TASK MEMORY: Capture analysis for future tasks
+                    if not task.target_file:
+                        task_memory += f"\n--- PERSISTENT ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
+                    context["task_memory"] = task_memory
+                    
+                    print(f"🛡️  The Gatekeeper is performing code review...")
+                    cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
+                    
+                    verification_method_used = None
+                    if cr_gate.approved:
+                        # STAGE THE CHANGE
+                        if task.target_file:
+                            PROTECTED_PATHS = ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"]
+                            if any(p in task.target_file for p in PROTECTED_PATHS):
+                                print(f"🛑 SOURCE GUARD BLOCKED WRITE: {task.target_file}")
+                            else:
+                                filepath = f"{self.target_repo}/{task.target_file}"
+                                print(f"💾 Pre-flight staging: {task.target_file}...")
+                                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                                
+                                # Read current content
+                                existing_content = ""
+                                if os.path.exists(filepath):
+                                    with open(filepath, "r") as f: existing_content = f.read()
+                                
+                                try:
+                                    # 1. APPLY PATCH IN MEMORY
+                                    updated_content = self.apply_patches(existing_content, w_output.diff)
+                                    
+                                    # 2. LINTER PRE-FLIGHT
+                                    dir_name = os.path.dirname(filepath)
+                                    base_name = os.path.basename(filepath)
+                                    tmp_path = os.path.join(dir_name, f".tmp.{base_name}")
+                                    tmp_rel_path = os.path.join(os.path.dirname(task.target_file), f".tmp.{base_name}")
+
+                                    with open(tmp_path, "w") as f: f.write(updated_content)
+                                    
+                                    ext = os.path.splitext(task.target_file)[1]
+                                    linter_cmd = None
+                                    if ext == ".ts": linter_cmd = f"npx tsc --noEmit {tmp_rel_path}"
+                                    elif ext == ".py": linter_cmd = f"python3 -m py_compile {tmp_rel_path}"
+                                    
+                                    if linter_cmd:
+                                        print(f"🔍 Running linter pre-flight on {task.target_file}...")
+                                        lint_out, lint_code = await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, linter_cmd)
+                                        if lint_code != 0:
+                                            os.remove(tmp_path)
+                                            raise ValueError(f"Linter pre-flight failed:\n{lint_out}")
+
+                                    # 3. ATOMIC COMMIT
+                                    os.rename(tmp_path, filepath)
+                                except Exception as e:
+                                    last_error_feedback = f"Surgical patch or linter failed: {str(e)}"
+                                    print(f"❌ Pre-flight failed: {str(e)}")
+                                    cr_gate.approved = False
+                                    continue
+
+                        print(f"🧪 Running autonomous reality check...")
+                        verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
+                        changed_files = [task.target_file] if task.target_file else []
+                        verification = await verifier.verify(temp_task.description, repo_context, changed_files)
+                        
+                        if not verification.success:
+                            print(f"❌ Reality check failed: {verification.reason}")
+                            cr_gate.approved = False
+                            cr_gate.error_type = "systematic"
+                            cr_gate.critique += f"\n\nEMPIRICAL FAILURE:\n{verification.reason}"
+                            last_error_feedback = cr_gate.critique
                         else:
-                            filepath = f"{self.target_repo}/{task.target_file}"
-                            print(f"💾 Staging changes to {task.target_file}...")
-                            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                            existing_content = ""
-                            if os.path.exists(filepath):
-                                with open(filepath, "r") as f: existing_content = f.read()
-                            try:
-                                updated_content = self.apply_patches(existing_content, w_output.diff)
-                                with open(filepath, "w") as f: f.write(updated_content)
-                            except Exception as e:
-                                logger.error("Patching failed during staging", error=str(e))
-                                last_error_feedback = f"Patching failed: {str(e)}"
-                                cr_gate.approved = False
-                                continue
-
-                    # EMPIRICAL VERIFICATION (Now runs against the staged file)
-                    logger.info("Running autonomous empirical verification", task_id=temp_task.id)
-                    sandbox = DockerSandbox(self.target_repo)
-                    verifier = VerifierEngine(sandbox=sandbox)
-                    
-                    changed_files = [task.target_file] if task.target_file else []
-                    verification = await verifier.verify(temp_task.description, repo_context, changed_files)
-                    
-                    if not verification.success:
-                        print(f"❌ Reality check failed: {verification.reason}")
-                        cr_gate.approved = False
-                        cr_gate.error_type = "systematic"
-                        cr_gate.critique += f"\n\nEMPIRICAL FAILURE:\n{verification.reason}"
-                        last_error_feedback = cr_gate.critique
-                    else:
-                        print(f"✨ Task {task.id} passed all gates.")
-                        all_diffs.append(w_output)
-                        await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
-                        await db.commit()
-                        task_success = True
-                        break
+                            print(f"✨ Task {task.id} passed all gates.")
+                            all_diffs.append(w_output)
+                            await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
+                            await db.commit()
+                            
+                            # GIT CHECKPOINT: Commit successfully completed task (LOCAL ONLY)
+                            print(f"📦 Creating local Git checkpoint for {task.id}...")
+                            checkpoint_cmd = f"git add . && git commit -m 'GATE Checkpoint: {task.id} - {task.description[:50]}'"
+                            await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, checkpoint_cmd)
+                            
+                            task_success = True
+                            break
 
                     await self._log_gate(db, arc_id, task.id, "codereview", cr_gate.approved, cr_gate.critique, error_type=cr_gate.error_type, attempt=task_attempt, verification_method=verification_method_used, metrics=cr_gate.metrics)
                     

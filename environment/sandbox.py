@@ -84,6 +84,15 @@ class DockerSandbox:
         output, exit_code = self.execute_command(f"cat {file_path}")
         return output
 
+    def read_file_window(self, file_path: str, start_line: int, end_line: int) -> str:
+        """ACI Paginator: Read a specific window of lines from a file."""
+        logger.info("Reading file window", path=file_path, start=start_line, end=end_line)
+        exists_out, _ = self.execute_command(f"[ -f {file_path} ] && echo 'yes' || echo 'no'")
+        if exists_out.strip() != "yes":
+            return "[File does not exist]"
+        output, _ = self.execute_command(f"sed -n '{start_line},{end_line}p' {file_path}")
+        return output
+
     def check_latex(self, file_path: str) -> str:
         """Check if a LaTeX file is valid by running a non-stop interaction build."""
         # Note: requires texlive or similar in the image
