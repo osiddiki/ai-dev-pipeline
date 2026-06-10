@@ -10,6 +10,7 @@ from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
 from agents.worker import WorkerAgent, WorkerResult
 from agents.gatekeeper import GatekeeperAgent
 from agents.researcher import ResearcherAgent
+from agents.models import GateConfig
 from orchestrator.verifier import VerifierEngine
 from ledger.database import get_db
 from environment.sandbox import DockerSandbox
@@ -57,9 +58,7 @@ class ReleaseArcOrchestrator:
         self, 
         target_repo: str, 
         guidelines: Optional[str] = None,
-        supervisor_model: str = "gemini/gemini-2.5-pro",
-        worker_model: str = "deepseek/deepseek-chat",
-        gatekeeper_model: str = "gemini/gemini-3.1-pro-preview"
+        config: Optional[GateConfig] = None
     ):
         self.target_repo = target_repo
         # Centralized metadata storage
@@ -68,10 +67,12 @@ class ReleaseArcOrchestrator:
         os.makedirs(self.metadata_dir, exist_ok=True)
         
         self.guidelines = guidelines or "Follow professional best practices."
-        self.supervisor = SupervisorAgent(model_id=supervisor_model)
-        self.worker = WorkerAgent(model_id=worker_model)
-        self.gatekeeper = GatekeeperAgent(model_id=gatekeeper_model)
-        self.researcher = ResearcherAgent(model_id=supervisor_model)
+        self.config = config or GateConfig()
+        
+        self.supervisor = SupervisorAgent(model_id=self.config.planner_model)
+        self.worker = WorkerAgent(model_id=self.config.executor_model)
+        self.gatekeeper = GatekeeperAgent(model_id=self.config.verifier_model)
+        self.researcher = ResearcherAgent(model_id=self.config.planner_model)
         
     async def gather_context(self) -> str:
         """Gather structural, textual, and symbolic context from the repository."""
@@ -335,6 +336,12 @@ class ReleaseArcOrchestrator:
                     print(f"🛡️  The Gatekeeper is performing code review...")
                     cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
                     
+                    if cr_gate.approved and cr_gate.confidence < self.config.min_gate_confidence:
+                        print(f"⚠️  Gatekeeper approved, but confidence ({cr_gate.confidence}) is below threshold ({self.config.min_gate_confidence}). Forcing retry.")
+                        cr_gate.approved = False
+                        cr_gate.error_type = "incoherent"
+                        cr_gate.critique += f"\n\nSYSTEM OVERRIDE: Approval confidence ({cr_gate.confidence}) too low."
+
                     verification_method_used = None
                     if cr_gate.approved:
                         # STAGE THE CHANGE
