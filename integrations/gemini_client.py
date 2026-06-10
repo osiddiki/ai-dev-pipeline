@@ -28,7 +28,13 @@ class LLMClient:
                 temperature=temperature,
                 max_tokens=8192
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            usage = response.usage
+            metrics = {
+                "prompt_tokens": usage.prompt_tokens if usage else 0,
+                "completion_tokens": usage.completion_tokens if usage else 0
+            }
+            return content, metrics
         except Exception as e:
             logger.error("LLM call failed", model=model_id, error=str(e))
             raise e

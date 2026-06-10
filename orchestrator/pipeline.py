@@ -4,11 +4,13 @@ import json
 import sys
 import os
 import re
+import traceback
 from typing import Any, Optional, List
 from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
 from agents.worker import WorkerAgent, WorkerResult
 from agents.gatekeeper import GatekeeperAgent
 from agents.researcher import ResearcherAgent
+from orchestrator.verifier import VerifierEngine
 from ledger.database import get_db
 from environment.sandbox import DockerSandbox
 
@@ -42,10 +44,10 @@ GENERAL SEVI STANDARDS:
 1. ARCHITECTURE: Respect the Monorepo structure and Federation patterns.
 2. INFRASTRUCTURE: When starting a NEW standalone utility, ensure the plan includes necessary project initialization (package.json, tsconfig.json) to make the code executable, but keep implementation tasks strictly scoped to the user's request.
 3. STANDARDS: Follow the established coding standards for the 21 microservices.
-3. DOCUMENTATION: Ensure all new components or changes are documented in ONBOARDING.md.
-4. TESTING: Always consider how changes will be tested across the federated system.
-5. SECURITY: Maintain strict HIPAA compliance protocols.
-6. SERIALIZATION: Tasks MUST be strictly sequential.
+4. DOCUMENTATION: Ensure all new components or changes are documented in ONBOARDING.md.
+5. TESTING: Always consider how changes will be tested across the federated system.
+6. SECURITY: Maintain strict HIPAA compliance protocols.
+7. SERIALIZATION: Tasks MUST be strictly sequential.
 """
 
 class ReleaseArcOrchestrator:
@@ -68,37 +70,32 @@ class ReleaseArcOrchestrator:
         
     async def gather_context(self) -> str:
         """Gather structural, textual, and symbolic context from the repository."""
-        logger.info("Gathering repository context", repo=self.target_repo)
         sandbox = DockerSandbox(self.target_repo)
-        structure = sandbox.execute_command("find . -maxdepth 2 -not -path '*/.*' 2>/dev/null || ls -F")
+        structure_out, _ = await asyncio.to_thread(sandbox.execute_command, "find . -maxdepth 2 -not -path '*/.*' 2>/dev/null || ls -F")
         with open("agents/repo_map.py", "r") as f:
             script_content = f.read()
         sandbox.write_file("repo_map_tool.py", script_content)
-        repo_map = sandbox.execute_command("python3 repo_map_tool.py .")
+        repo_map_out, _ = await asyncio.to_thread(sandbox.execute_command, "python3 repo_map_tool.py .")
         doc_files = ["AGENTS.md", "sevicare-app/AGENTS.md", "README.md", "CONTRIBUTING.md", "sevicare-app/README.md"]
         docs_content = []
         for doc in doc_files:
-            is_file = sandbox.execute_command(f"[ -f {doc} ] && echo 'yes' || echo 'no'").strip()
-            if is_file == "yes":
-                content = sandbox.read_file(doc)
-                if "Error" not in content and len(content.strip()) > 0:
-                    docs_content.append(f"--- FILE: {doc} ---\n{content[:2000]}")
-        repowise_check = sandbox.execute_command("find . -name '*repowise*' -type f -maxdepth 4 2>/dev/null")
-        if repowise_check.strip():
-            for rw_file in repowise_check.strip().split("\n")[:3]:
+            content = sandbox.read_file(doc)
+            if "[File does not exist]" not in content and len(content.strip()) > 0:
+                docs_content.append(f"--- FILE: {doc} ---\n{content[:2000]}")
+        repowise_out, _ = await asyncio.to_thread(sandbox.execute_command, "find . -name '*repowise*' -type f -maxdepth 4 2>/dev/null")
+        if repowise_out.strip():
+            for rw_file in repowise_out.strip().split("\n")[:3]:
                 rw_content = sandbox.read_file(rw_file)
-                if "Error" not in rw_content:
+                if "[File does not exist]" not in rw_content:
                     docs_content.append(f"--- REPOWISE: {rw_file} ---\n{rw_content[:3000]}")
-        full_context = f"REPOSITORY STRUCTURE:\n{structure}\n\nSYMBOL MAP:\n{repo_map}\n\nCRITICAL DOCUMENTATION:\n" + "\n".join(docs_content)
+        full_context = f"REPOSITORY STRUCTURE:\n{structure_out}\n\nSYMBOL MAP:\n{repo_map_out}\n\nCRITICAL DOCUMENTATION:\n" + "\n".join(docs_content)
         return full_context
 
     def apply_patches(self, current_content: str, response: str) -> str:
-        """Parse and apply SEARCH/REPLACE blocks to the current content."""
-        # Pattern to match SEARCH/REPLACE blocks
-        pattern = re.compile(r"<<<< SEARCH\n(.*?)\n====\n(.*?)\n>>>> REPLACE", re.DOTALL)
+        """Parse and apply SEARCH/REPLACE blocks with flexible separator support."""
+        pattern = re.compile(r"<<<< SEARCH\n(.*?)\n={4,10}\n(.*?)\n>>>> REPLACE", re.DOTALL)
         blocks = pattern.findall(response)
         if not blocks:
-            # Fallback: if no blocks found, maybe it's analysis or a full-file block
             if "```" in response:
                 parts = response.split("```")
                 if len(parts) >= 3:
@@ -109,85 +106,123 @@ class ReleaseArcOrchestrator:
         new_content = current_content
         for search, replace in blocks:
             if not search.strip() and not current_content.strip():
-                # New file case: Empty search, empty current content
                 new_content = replace
             else:
-                # Surgical edit case
                 if search in new_content:
                     new_content = new_content.replace(search, replace)
                 else:
-                    logger.error("SEARCH block not found in file content", search_preview=search[:100])
+                    logger.error("SEARCH block match failed", search_preview=search[:50])
                     raise ValueError(f"Surgical patch failed: Could not find exact match for SEARCH block in the file.")
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
+        """Process a task through the GATE framework with Checkpoint & Resume."""
         db = await get_db()
-        repo_context = None
-        discovery_report = None
-        async with db.execute(
-            "SELECT id, status, repo_context, discovery_report FROM release_arcs WHERE issue_id = ? AND status != 'completed' ORDER BY id DESC LIMIT 1", 
-            (issue_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                arc_id, _, repo_context, discovery_report = row
-                logger.info("Resuming existing Release Arc", arc_id=arc_id, issue_id=issue_id)
-                await db.execute("UPDATE release_arcs SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (arc_id,))
+        arc_id = None
+        
+        try:
+            # CHECKPOINT: Look for existing arc
+            repo_context = None
+            discovery_report = None
+            async with db.execute(
+                "SELECT id, status, repo_context, discovery_report FROM release_arcs WHERE issue_id = ? AND status != 'completed' ORDER BY id DESC LIMIT 1", 
+                (issue_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    arc_id, _, repo_context, discovery_report = row
+                    print(f"🔄 Resuming existing mission: {issue_id}")
+                    await db.execute("UPDATE release_arcs SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (arc_id,))
+                else:
+                    print(f"🎯 Starting new mission: {issue_id}")
+                    cursor = await db.execute("INSERT INTO release_arcs (issue_id, repository, status) VALUES (?, ?, 'planning')", (issue_id, self.target_repo, 'planning'))
+                    arc_id = cursor.lastrowid
+                await db.commit()
+
+            print(f"🔍 The Scout is mapping the repository...")
+            repo_context = await self.gather_context()
+            await db.execute("UPDATE release_arcs SET repo_context = ? WHERE id = ?", (repo_context, arc_id))
+            await db.commit()
+
+            force_research = False
+            async with db.execute("SELECT error_type FROM gate_reviews WHERE arc_id = ? ORDER BY id DESC LIMIT 1", (arc_id,) ) as cursor:
+                last_error = await cursor.fetchone()
+                if last_error and last_error[0] == 'incoherent':
+                    print("⚠️  The team is confused. Re-performing deep research...")
+                    force_research = True
+
+            if not discovery_report or force_research:
+                print("🧠 The Researcher is studying your requirements...")
+                research_result = await self.researcher.invoke({"repo_path": self.target_repo, "repo_context": repo_context}, issue_description)
+                discovery_report = research_result.output
+                await db.execute("UPDATE release_arcs SET discovery_report = ? WHERE id = ?", (discovery_report, arc_id))
+                await db.commit()
             else:
-                logger.info("Starting New Release Arc", issue_id=issue_id, repo=self.target_repo)
-                cursor = await db.execute("INSERT INTO release_arcs (issue_id, repository, status) VALUES (?, ?, 'planning')", (issue_id, self.target_repo, 'planning'))
-                arc_id = cursor.lastrowid
-            await db.commit()
+                print("📂 Using cached project intelligence.")
+            
+            context = {"guidelines": self.guidelines, "repo_path": self.target_repo, "repo_context": repo_context, "discovery_report": discovery_report}
+            
+            plan = None
+            if manual_plan:
+                print("📋 Using manual override plan.")
+                plan = manual_plan
+            else:
+                print("🏗️  The Architect is decomposing the requirements into a plan...")
+                plan_result = await self.supervisor.invoke(context, issue_description)
+                if not plan_result.success: return False
+                plan = plan_result.output
+                
+                max_revisions = 3
+                for attempt in range(max_revisions + 1):
+                    print(f"🛡️  The Gatekeeper is reviewing the plan (Attempt {attempt+1})...")
+                    plan_gate = await self.gatekeeper.review_plan(issue_description, plan)
+                    await self._log_gate(db, arc_id, None, "review_plan", plan_gate.approved, plan_gate.critique, error_type=plan_gate.error_type, attempt=attempt+1, metrics=plan_gate.metrics)
+                    if plan_gate.approved:
+                        print("✅ Plan approved.")
+                        break
+                    if attempt < max_revisions:
+                        print(f"❌ Plan rejected: {plan_gate.error_type}. The Architect is revising...")
+                        revision_result = await self.supervisor.revise_plan(plan, plan_gate.critique, context)
+                        if not revision_result.success: return False
+                        plan = revision_result.output
+                    else:
+                        print("🚫 Plan failed final review.")
+                        return False
 
-        repo_context = await self.gather_context()
-        await db.execute("UPDATE release_arcs SET repo_context = ? WHERE id = ?", (repo_context, arc_id))
-        await db.commit()
+            all_diffs = []
+            task_memory = "" # PERSISTENT CONTEXT FOR THE WHOLE ARC
+            
+            # TOPOLOGICAL SORT
+            task_dict = {t.id: t for t in plan.tasks}
+            resolved = []
+            visited = set()
+            visiting = set()
+            
+            def visit(task_id):
+                if task_id in visited: return True
+                if task_id in visiting: return False # Circular dependency
+                visiting.add(task_id)
+                task = task_dict.get(task_id)
+                if task:
+                    for dep in task.dependencies:
+                        if not visit(dep): return False
+                    resolved.append(task)
+                visiting.remove(task_id)
+                visited.add(task_id)
+                return True
 
-        force_research = False
-        async with db.execute("SELECT error_type FROM gate_reviews WHERE arc_id = ? ORDER BY id DESC LIMIT 1", (arc_id,)) as cursor:
-            last_error = await cursor.fetchone()
-            if last_error and last_error[0] == 'incoherent':
-                logger.info("Forcing research refresh due to previous incoherence")
-                force_research = True
+            for task in plan.tasks:
+                if not visit(task.id):
+                    logger.error("Circular dependency detected in plan")
+                    return False
+                    
+            print(f"🚦 Execution order resolved ({len(resolved)} tasks).")
 
-        if not discovery_report or force_research:
-            research_result = await self.researcher.invoke({"repo_path": self.target_repo, "repo_context": repo_context}, issue_description)
-            discovery_report = research_result.output
-            await db.execute("UPDATE release_arcs SET discovery_report = ? WHERE id = ?", (discovery_report, arc_id))
-            await db.commit()
-        else:
-            logger.info("Using cached Technical Discovery Report")
-        
-        context = {"guidelines": self.guidelines, "repo_path": self.target_repo, "repo_context": repo_context, "discovery_report": discovery_report}
-        
-        plan = None
-        if manual_plan:
-            logger.info("Using Manual Override Plan.")
-            plan = manual_plan
-        else:
-            plan_result = await self.supervisor.invoke(context, issue_description)
-            if not plan_result.success: return False
-            plan = plan_result.output
-            max_revisions = 3
-            for attempt in range(max_revisions + 1):
-                plan_gate = await self.gatekeeper.review_plan(issue_description, plan)
-                await self._log_gate(db, arc_id, None, "review_plan", plan_gate.approved, plan_gate.critique, error_type=plan_gate.error_type, attempt=attempt+1)
-                if plan_gate.approved:
-                    logger.info("Plan approved by Gatekeeper", attempt=attempt+1)
-                    break
-                if attempt < max_revisions:
-                    logger.warning("Plan rejected. Requesting autonomous revision.", attempt=attempt+1)
-                    revision_result = await self.supervisor.revise_plan(plan, plan_gate.critique, context)
-                    if not revision_result.success: return False
-                    plan = revision_result.output
-                else: return False
-
-        all_diffs = []
-        for task in plan.tasks:
-            async with db.execute("SELECT status FROM tasks WHERE arc_id = ? AND description = ? AND status = 'completed'", (arc_id, task.description)) as cursor:
-                if await cursor.fetchone():
-                    logger.info("Skipping already completed task", task_id=task.id)
-                    continue
+            for task in resolved:
+                async with db.execute("SELECT status FROM tasks WHERE arc_id = ? AND description = ? AND status = 'completed'", (arc_id, task.description)) as cursor:
+                    if await cursor.fetchone():
+                        print(f"⏭️  Skipping completed task: {task.id}")
+                        continue
 
             max_task_attempts = 3
             task_attempt = 0
@@ -200,109 +235,155 @@ class ReleaseArcOrchestrator:
 
             while task_attempt < max_task_attempts:
                 task_attempt += 1
-                logger.info("Executing Task", task_id=task.id, attempt=task_attempt)
+                
+                # Strike-Two Breakout: Ask human for hint after 2 fails
+                if task_attempt == 3 and not task_success:
+                    print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: The AI is stuck on {task.id}\nCRITIQUE: {last_error_feedback[:300]}\n" + "!"*60)
+                    user_hint = input("\nProvide a strategic hint to break the loop, or type 'skip': ").strip()
+                    if user_hint.lower() == 'skip':
+                        task_success = True
+                        break
+                    elif user_hint:
+                        current_task_desc += f"\n\nSTRATEGIC HINT: {user_hint}"
+
+                print(f"🔨 The Engineer is working on {task.id} (Attempt {task_attempt})...")
                 mission_desc = current_task_desc
                 if task_attempt > 1:
-                    logger.warning("Retrying task with feedback", task_id=task.id)
+                    print(f"🔄 Retrying {task.id} with self-healing feedback...")
                     mission_desc += f"\n\nPREVIOUS FAILURE FEEDBACK:\n{last_error_feedback}"
-                temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file)
+                
+                temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies)
                 design_gate = await self.gatekeeper.review_design(temp_task, f"Design for {temp_task.id}")
                 if not design_gate.approved: continue
-                worker_res = await self.worker.invoke(context, temp_task)
-                w_output: WorkerResult = worker_res.output
-                cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
                 
-                verification_output = ""
-                is_test_task = any(word in temp_task.description.lower().split() for word in ["test", "tests"]) or "run test" in temp_task.description.lower()
-                is_check_task = any(word in temp_task.description.lower().split() for word in ["verify", "check"])
-                if cr_gate.approved and (is_test_task or is_check_task):
-                    logger.info("Running empirical verification", task_id=temp_task.id)
-                    sandbox = DockerSandbox(self.target_repo)
-                    if is_test_task:
-                        has_pkg = "yes" in sandbox.execute_command("[ -f test-data-generator/package.json ] && echo 'yes' || echo 'no'")
-                        has_test_script = "yes" in sandbox.execute_command("grep '\"test\":' test-data-generator/package.json && echo 'yes' || echo 'no'") if has_pkg else False
-                        if not has_pkg or not has_test_script:
-                            logger.warning("Skipping real-world test: Project foundation not ready.")
-                            verification_output = "SKIPPED: package.json or test script missing"
-                        else:
-                            has_pnpm = "yes" in sandbox.execute_command("command -v pnpm && echo 'yes' || echo 'no'")
-                            cmd = f"cd test-data-generator && {'pnpm test' if has_pnpm else 'npm test'}"
-                            verification_output = sandbox.execute_command(cmd)
-                    else:
-                        cmd = f"ls {temp_task.target_file}" if temp_task.target_file else "ls -R"
-                        verification_output = sandbox.execute_command(cmd)
-                    if "fail" in verification_output.lower() or "error" in verification_output.lower():
-                        cr_gate.approved = False
-                        cr_gate.error_type = "systematic"
-                        cr_gate.critique += f"\n\nEMPIRICAL FAILURE:\n{verification_output}"
+                # TEMPERATURE ESCALATION: Increase creativity on retries (0.3 -> 0.5 -> 0.7)
+                retry_temp = 0.3 + (task_attempt - 1) * 0.2
+                
+                worker_res = await self.worker.invoke(context, temp_task, temperature=retry_temp)
+ # We need to update Worker to accept temp
+                    w_output: WorkerResult = worker_res.output
+                    
+                    if not task.target_file:
+                        task_memory += f"\n--- PERSISTENT ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
+                    context["task_memory"] = task_memory
+                    
+                    print(f"🛡️  The Gatekeeper is performing code review...")
+                    cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
+                    
+                    verification_method_used = None
+                    if cr_gate.approved:
+                        if task.target_file:
+                            PROTECTED_PATHS = ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"]
+                            if any(p in task.target_file for p in PROTECTED_PATHS):
+                                print(f"🛑 SOURCE GUARD BLOCKED WRITE: {task.target_file}")
+                            else:
+                                filepath = f"{self.target_repo}/{task.target_file}"
+                                print(f"💾 Staging changes to {task.target_file}...")
+                                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                                existing_content = ""
+                                if os.path.exists(filepath):
+                                    with open(filepath, "r") as f: existing_content = f.read()
+                                try:
+                                    updated_content = self.apply_patches(existing_content, w_output.diff)
+                                    with open(filepath, "w") as f: f.write(updated_content)
+                                except Exception as e:
+                                    last_error_feedback = f"Patching failed: {str(e)}"
+                                    print(f"❌ Patching failed: {str(e)}")
+                                    cr_gate.approved = False
+                                    continue
 
-                await self._log_gate(db, arc_id, task.id, "codereview", cr_gate.approved, cr_gate.critique, error_type=cr_gate.error_type, attempt=task_attempt)
-                
-                if cr_gate.approved:
-                    all_diffs.append(w_output)
-                    if task.target_file:
-                        PROTECTED_PATHS = ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"]
-                        if any(p in task.target_file for p in PROTECTED_PATHS):
-                            logger.warning("SOURCE GUARD BLOCKED WRITE", path=task.target_file)
+                        print(f"🧪 Running autonomous reality check...")
+                        verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
+                        changed_files = [task.target_file] if task.target_file else []
+                        verification = await verifier.verify(temp_task.description, repo_context, changed_files)
+                        
+                        if not verification.success:
+                            print(f"❌ Reality check failed: {verification.reason}")
+                            cr_gate.approved = False
+                            cr_gate.error_type = "systematic"
+                            cr_gate.critique += f"\n\nEMPIRICAL FAILURE:\n{verification.reason}"
+                            last_error_feedback = cr_gate.critique
                         else:
-                            filepath = f"{self.target_repo}/{task.target_file}"
-                            logger.info("Applying surgical patches", file=filepath)
-                            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                            existing_content = ""
-                            if os.path.exists(filepath):
-                                with open(filepath, "r") as f: existing_content = f.read()
-                            try:
-                                updated_content = self.apply_patches(existing_content, w_output.diff)
-                                with open(filepath, "w") as f: f.write(updated_content)
-                            except Exception as e:
-                                logger.error("Patching failed", error=str(e))
-                                last_error_feedback = str(e)
-                                cr_gate.approved = False
-                                continue
-                    await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
-                    await db.commit()
-                    task_success = True
-                    break
-                else:
-                    last_error_feedback = cr_gate.critique
-                    logger.error("Task attempt failed", task_id=task.id, attempt=task_attempt, error_type=cr_gate.error_type)
-                    if task_attempt == max_task_attempts:
-                        print("\n" + "!"*60 + f"\n🚨 SELF-HEALING FAILED for {task.id}\nCRITIQUE: {last_error_feedback[:300]}\n" + "!"*60)
-                        user_hint = input("\nThe AI is stuck. Provide a hint to fix this, or type 'skip': ").strip()
-                        if user_hint.lower() == 'skip':
+                            print(f"✨ Task {task.id} passed all gates.")
+                            all_diffs.append(w_output)
+                            await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
+                            await db.commit()
                             task_success = True
                             break
-                        elif user_hint:
-                            logger.info("Retrying with human guidance...")
-                            current_task_desc += f"\n\nUSER GUIDANCE: {user_hint}"
-                            max_task_attempts += 1 
-            if not task_success: return False
-                
-        final_gate = await self.gatekeeper.review_code(issue_description, plan, all_diffs)
-        await self._log_gate(db, arc_id, None, "review_code", final_gate.approved, final_gate.critique, error_type=final_gate.error_type)
-        status = "completed" if final_gate.approved else "failed"
-        await db.execute("UPDATE release_arcs SET status = ? WHERE id = ?", (status, arc_id))
-        await db.commit()
-        logger.info("Release Arc finished", status=status)
-        return final_gate.approved
 
-    async def _log_gate(self, db, arc_id, task_id, gate_name, approved, critique, error_type=None, attempt=1):
+                    await self._log_gate(db, arc_id, task.id, "codereview", cr_gate.approved, cr_gate.critique, error_type=cr_gate.error_type, attempt=task_attempt, verification_method=verification_method_used, metrics=cr_gate.metrics)
+                    
+                    if not cr_gate.approved:
+                        last_error_feedback = cr_gate.critique
+                        print(f"❌ Gate review failed: {cr_gate.error_type}. Self-healing...")
+                
+                if not task_success:
+                    print(f"🚫 Task {task.id} failed after {max_task_attempts} attempts.")
+                    return False
+                    
+            print(f"🏁 Finalizing mission review...")
+            final_gate = await self.gatekeeper.review_code(issue_description, plan, all_diffs)
+            await self._log_gate(db, arc_id, None, "review_code", final_gate.approved, final_gate.critique, error_type=final_gate.error_type, metrics=final_gate.metrics)
+            status = "completed" if final_gate.approved else "failed"
+            await db.execute("UPDATE release_arcs SET status = ? WHERE id = ?", (status, arc_id))
+            await db.commit()
+            print(f"\n🚀 Mission Status: {status.upper()}")
+            return final_gate.approved
+            
+        except Exception as e:
+            print(f"\n💥 PIPELINE CRASHED: {str(e)}")
+            traceback.print_exc()
+            if arc_id:
+                await db.execute("UPDATE release_arcs SET status = 'failed' WHERE id = ?", (arc_id,))
+                await self._log_gate(db, arc_id, None, "INTERNAL_CRASH", False, f"Python Exception: {str(e)}\n\n{traceback.format_exc()}", error_type="systematic")
+                await db.commit()
+            return False
+
+    async def _log_gate(self, db, arc_id, task_id, gate_name, approved, critique, error_type=None, attempt=1, verification_method=None, metrics=None):
         status = "approved" if approved else "rejected"
-        await db.execute(
-            """INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt)
-        )
+        metrics = metrics or {}
+        prompt_t = metrics.get("prompt_tokens", 0)
+        comp_t = metrics.get("completion_tokens", 0)
+        try:
+            await db.execute(
+                """INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number, verification_method, prompt_tokens, completion_tokens)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt, verification_method, prompt_t, comp_t)
+            )
+        except Exception as e:
+             await db.execute(
+                """INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt)
+            )
         await db.commit()
 
 if __name__ == "__main__":
     async def run():
-        orch = ReleaseArcOrchestrator(target_repo="/Users/omarsiddiki/sevisolutions", guidelines=SEVI_GUIDELINES)
-        print("\n" + "="*50 + "\n🚀 GATE PIPELINE: SEVI TEST DATA GENERATOR\n" + "="*50)
-        issue_id = input("\nEnter Issue ID [GEN-001]: ").strip() or "GEN-001"
-        print("\nDescribe the task (Press Enter for Phase 1 default):")
-        default_task = "Analyze provider-portal-app/e2e/patient-data.ts and create a standalone types.ts file in a new directory test-data-generator/src/ that includes all necessary interfaces for a Unified Patient Model. Ensure the directory is initialized with a basic package.json."
-        print(f"[Default]: {default_task}")
-        issue_desc = input("\nTask Description: ").strip() or default_task
-        await orch.process_issue(issue_id, issue_desc)
+        try:
+            print("\n" + "="*50 + "\n🚀 GATE PIPELINE: SEVI TEST DATA GENERATOR\n" + "="*50)
+            default_repo = "/Users/omarsiddiki/sevisolutions"
+            repo_input = input(f"\nEnter Target Repo Path [{default_repo}]: ").strip()
+            target_repo = repo_input if repo_input else default_repo
+            orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=SEVI_GUIDELINES)
+            issue_id = input("\nEnter Issue ID [GEN-001]: ").strip() or "GEN-001"
+            print("\nDescribe the task (Press Enter for Phase 1 default):")
+            default_task = "Analyze provider-portal-app/e2e/patient-data.ts and create a standalone types.ts file in a new directory test-data-generator/src/ that includes all necessary interfaces for a Unified Patient Model. Ensure the directory is initialized with a basic package.json."
+            print(f"[Default]: {default_task}")
+            issue_desc = input("\nTask Description: ").strip() or default_task
+            await orch.process_issue(issue_id, issue_desc)
+        except KeyboardInterrupt:
+            print("\n👋 Shutdown requested by user.")
+        except Exception as e:
+            print(f"\n💥 STARTUP ERROR: {str(e)}")
+        finally:
+            pending = asyncio.all_tasks()
+            for task in pending:
+                if task is not asyncio.current_task(): task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.gather(*[p for p in pending if p is not asyncio.current_task()], return_exceptions=True), timeout=2.0)
+            except: pass
+            loop = asyncio.get_event_loop()
+            await loop.shutdown_asyncgens()
+            print("✨ Resources released.")
     asyncio.run(run())

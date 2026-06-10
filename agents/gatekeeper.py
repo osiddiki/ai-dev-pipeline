@@ -13,6 +13,7 @@ class GateResult(BaseModel):
     approved: bool
     error_type: Optional[str] = None # systematic, omission, incoherent
     critique: str
+    metrics: dict[str, int] = {}
 
 class GatekeeperAgent(BaseAgent):
     name = "gatekeeper"
@@ -30,10 +31,10 @@ class GatekeeperAgent(BaseAgent):
             {"role": "user", "content": f"Requirement: {issue}\nProposed Plan: {plan.json()}\nDoes this plan have any omissions or logical flaws? Respond using the prescribed format."}
         ]
         
-        raw_response = await LLMClient.chat(model_id=self.model_id, messages=messages)
-        return self._parse_response(raw_response)
+        raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages)
+        return self._parse_response(raw_response, metrics)
 
-    def _parse_response(self, raw_response: str) -> GateResult:
+    def _parse_response(self, raw_response: str, metrics: dict[str, int] = {}) -> GateResult:
         """Extract STATUS and ERROR_TYPE from the Gatekeeper's response."""
         response_upper = raw_response.upper()
         
@@ -46,13 +47,13 @@ class GatekeeperAgent(BaseAgent):
             elif "ERROR_TYPE: SYSTEMATIC" in response_upper: error_type = "systematic"
             elif "ERROR_TYPE: INCOHERENT" in response_upper: error_type = "incoherent"
         
-        return GateResult(approved=is_approved, error_type=error_type, critique=raw_response)
+        return GateResult(approved=is_approved, error_type=error_type, critique=raw_response, metrics=metrics)
 
     async def review_design(self, task: TaskDefinition, proposed_design: str) -> GateResult:
         """Gate 2: Pre-code technical approach validation."""
         logger.info("Gatekeeper running 'review_design' gate", task=task.id)
         # TODO: Implement design review logic
-        return GateResult(approved=True, critique="Design aligns with repository architecture.")
+        return GateResult(approved=True, critique="Design aligns with repository architecture.", metrics={})
 
     async def codereview(self, task: TaskDefinition, worker_result: WorkerResult) -> GateResult:
         """Gate 3: Narrow context file-scoped review."""
@@ -63,8 +64,8 @@ class GatekeeperAgent(BaseAgent):
             {"role": "user", "content": f"Task: {task.description}\nImplementation Diff:\n{worker_result.diff}\nValidation Output: {worker_result.linter_output}\nRespond using the prescribed format."}
         ]
         
-        raw_response = await LLMClient.chat(model_id=self.model_id, messages=messages)
-        return self._parse_response(raw_response)
+        raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages)
+        return self._parse_response(raw_response, metrics)
 
     async def review_code(self, issue: str, plan: SupervisorPlan, diffs: List[WorkerResult]) -> GateResult:
         """Gate 4: Broad context task validation."""
@@ -76,5 +77,5 @@ class GatekeeperAgent(BaseAgent):
             {"role": "user", "content": f"Original Requirement: {issue}\nComplete Implementation:\n{all_diffs_text}\nRespond using the prescribed format."}
         ]
         
-        raw_response = await LLMClient.chat(model_id=self.model_id, messages=messages)
-        return self._parse_response(raw_response)
+        raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages)
+        return self._parse_response(raw_response, metrics)

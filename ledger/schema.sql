@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS gate_reviews (
     error_type TEXT, -- systematic, omission, incoherent
     critique_summary TEXT,
     attempt_number INTEGER DEFAULT 1,
+    verification_method TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (task_id) REFERENCES tasks(id),
     FOREIGN KEY (arc_id) REFERENCES release_arcs(id)

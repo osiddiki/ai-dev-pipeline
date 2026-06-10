@@ -20,7 +20,7 @@ class SupervisorPlan(BaseModel):
 class SupervisorAgent(BaseAgent):
     name = "supervisor"
     
-    async def invoke(self, context: dict[str, Any], input_data: str) -> AgentResult:
+    async def invoke(self, context: dict[str, Any], input_data: str, temperature: float = 0.3) -> AgentResult:
         """
         Input: Task description.
         Output: A decomposed list of atomic tasks.
@@ -41,7 +41,7 @@ class SupervisorAgent(BaseAgent):
             {"role": "user", "content": f"Please decompose this requirement into tasks: {input_data}"}
         ]
         
-        raw_response = await LLMClient.chat(model_id=self.model_id, messages=messages)
+        raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, temperature=temperature)
         
         try:
             # Clean possible markdown code blocks if the model includes them
@@ -53,7 +53,7 @@ class SupervisorAgent(BaseAgent):
             logger.error("Failed to parse supervisor plan", error=str(e), raw=raw_response)
             return AgentResult(success=False, output=f"Parsing error: {str(e)}")
     
-    async def revise_plan(self, plan: SupervisorPlan, critique: str, context: dict[str, Any] = {}) -> AgentResult:
+    async def revise_plan(self, plan: SupervisorPlan, critique: str, context: dict[str, Any] = {}, temperature: float = 0.3) -> AgentResult:
         """Revise the plan based on gatekeeper feedback."""
         logger.info("Supervisor revising plan based on critique")
         
@@ -71,7 +71,7 @@ class SupervisorAgent(BaseAgent):
             {"role": "user", "content": f"Your previous plan was rejected. Critique: {critique}. Original plan: {plan.json()}. Please provide a revised plan in JSON format."}
         ]
         
-        raw_response = await LLMClient.chat(model_id=self.model_id, messages=messages)
+        raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, temperature=temperature)
         try:
             clean_json = raw_response.strip().replace("```json", "").replace("```", "").strip()
             plan_data = json.loads(clean_json)

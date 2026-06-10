@@ -32,7 +32,7 @@ class DockerSandbox:
         self.container_workspace = "/workspace"
         self.image = image
         
-    def execute_command(self, command: str) -> str:
+    def execute_command(self, command: str) -> tuple[str, int]:
         """Run a command inside a sandboxed container mounted with the repo."""
         logger.info("Executing command in sandbox", command=command, repo=str(self.target_repo_path))
         
@@ -48,16 +48,22 @@ class DockerSandbox:
                     }
                 },
                 working_dir=self.container_workspace,
-                remove=True,
-                detach=False,
-                # Security: Limit resources and networking if needed
+                detach=True, # Detach to wait for result
                 mem_limit="512m",
-                network_disabled=False # Set to True for pure offline code generation
+                network_disabled=False
             )
-            return container.decode("utf-8")
+            result = container.wait()
+            exit_code = result.get("StatusCode", 0)
+            output = container.logs().decode("utf-8")
+            container.remove()
+            
+            if exit_code != 0:
+                logger.error("Sandbox execution failed", exit_code=exit_code)
+                
+            return output, exit_code
         except Exception as e:
-            logger.error("Sandbox execution failed", error=str(e))
-            return f"Error executing command: {str(e)}"
+            logger.error("Sandbox exception", error=str(e))
+            return f"Error executing command: {str(e)}", 1
         
     def write_file(self, file_path: str, content: str) -> bool:
         """Write content to a file in the sandbox using base64 for safety."""
@@ -65,16 +71,22 @@ class DockerSandbox:
         import base64
         encoded = base64.b64encode(content.encode('utf-8')).decode('utf-8')
         # We use a temp file and move it to avoid partial writes if base64 fails
-        res = self.execute_command(f"echo '{encoded}' | base64 -d > {file_path}")
-        return "Error" not in res
+        output, exit_code = self.execute_command(f"echo '{encoded}' | base64 -d > {file_path}")
+        return exit_code == 0
 
     def read_file(self, file_path: str) -> str:
-        """Read a file from the sandbox."""
+        """Read a file from the sandbox safely."""
         logger.info("Reading file in sandbox", path=file_path)
-        return self.execute_command(f"cat {file_path}")
+        # Check if exists first to avoid error log noise
+        exists_out, exists_code = self.execute_command(f"[ -f {file_path} ] && echo 'yes' || echo 'no'")
+        if exists_out.strip() != "yes":
+            return "[File does not exist]"
+        output, exit_code = self.execute_command(f"cat {file_path}")
+        return output
 
     def check_latex(self, file_path: str) -> str:
         """Check if a LaTeX file is valid by running a non-stop interaction build."""
         # Note: requires texlive or similar in the image
         logger.info("Verifying LaTeX integrity", path=file_path)
-        return self.execute_command(f"pdflatex -interaction=nonstopmode -halt-on-error {file_path}")
+        output, exit_code = self.execute_command(f"pdflatex -interaction=nonstopmode -halt-on-error {file_path}")
+        return output

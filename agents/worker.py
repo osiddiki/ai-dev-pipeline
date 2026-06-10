@@ -1,4 +1,5 @@
 from typing import Any
+import asyncio
 from pydantic import BaseModel
 from .base import BaseAgent, AgentResult
 from .supervisor import TaskDefinition
@@ -17,7 +18,7 @@ class WorkerResult(BaseModel):
 class WorkerAgent(BaseAgent):
     name = "worker"
     
-    async def invoke(self, context: dict[str, Any], input_data: TaskDefinition) -> AgentResult:
+    async def invoke(self, context: dict[str, Any], input_data: TaskDefinition, temperature: float = 0.3) -> AgentResult:
         """
         Input: A specific, bounded task.
         Output: The proposed code diff and validation output from the sandbox.
@@ -52,22 +53,24 @@ class WorkerAgent(BaseAgent):
             if "Error" in current_content:
                 current_content = "[File not found in sandbox]"
 
-        repo_state = sandbox.execute_command("ls -R")
+        repo_state, _ = await asyncio.to_thread(sandbox.execute_command, "ls -R")
         
         # 2. Call the LLM to generate the solution
+        task_memory = context.get("task_memory", "")
         messages = [
             {"role": "system", "content": WORKER_PROMPT},
-            {"role": "user", "content": f"TECHNICAL DISCOVERY REPORT:\n{discovery_report}\n\nRepo State:\n{repo_state}\n\nCurrent File Content ({file_to_read}):\n{current_content}\n\nTask: {input_data.description}"}
+            {"role": "user", "content": f"TECHNICAL DISCOVERY REPORT:\n{discovery_report}\n\nPROJECT MEMORY (PREVIOUS ANALYSES):\n{task_memory}\n\nRepo State:\n{repo_state}\n\nCurrent File Content ({file_to_read}):\n{current_content}\n\nTask: {input_data.description}"}
         ]
         
-        raw_response = await LLMClient.chat(model_id=self.model_id, messages=messages)
+        raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, temperature=temperature)
         
         # 3. Validation Phase
         validation_output = "No validation performed."
-        if file_to_read.endswith(".tex"):
-            validation_output = "LaTeX content updated and verified for macro integrity."
-        elif file_to_read.endswith(".py"):
-            validation_output = "Python syntax check passed."
+        if file_to_read:
+            if file_to_read.endswith(".tex"):
+                validation_output = "LaTeX content updated and verified for macro integrity."
+            elif file_to_read.endswith(".py"):
+                validation_output = "Python syntax check passed."
 
         return AgentResult(
             success=True,

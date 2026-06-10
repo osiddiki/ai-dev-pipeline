@@ -1,6 +1,7 @@
 import sqlite3
 import aiosqlite
 import structlog
+import os
 from pathlib import Path
 
 logger = structlog.get_logger()
@@ -11,6 +12,8 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 async def init_db():
     """Initialize the SQLite database with the schema."""
     logger.info("Initializing database", db_path=str(DB_PATH))
+    # Ensure directory exists
+    os.makedirs(DB_PATH.parent, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         with open(SCHEMA_PATH, "r") as f:
             schema_script = f.read()
@@ -27,6 +30,8 @@ async def get_db():
 def init_db_sync():
     """Synchronous init for startup script."""
     logger.info("Initializing database synchronously", db_path=str(DB_PATH))
+    # Ensure directory exists
+    os.makedirs(DB_PATH.parent, exist_ok=True)
     with sqlite3.connect(DB_PATH) as db:
         with open(SCHEMA_PATH, "r") as f:
             db.executescript(f.read())
