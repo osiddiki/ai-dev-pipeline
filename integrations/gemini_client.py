@@ -1,40 +1,34 @@
 import os
 from litellm import acompletion
+import litellm
 import structlog
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = structlog.get_logger()
 
-class GeminiClient:
-    """Wrapper for Gemini model interactions via LiteLLM."""
-    
-    # We use Flash for speed/cost on workers, Pro for the Gatekeeper reviews.
-    MODELS = {
-        "worker": "gemini/gemini-2.5-flash",
-        "supervisor": "gemini/gemini-2.5-flash",
-        "gatekeeper": "gemini/gemini-2.5-pro"
-    }
+class LLMClient:
+    """Wrapper for LLM interactions via LiteLLM supporting multiple providers."""
 
     @classmethod
-    async def chat(cls, role: str, messages: list[dict], temperature: float = 0.3):
-        model = cls.MODELS.get(role, "gemini/gemini-1.5-flash")
-        api_key = os.getenv("GEMINI_API_KEY")
-        
-        if not api_key:
-            logger.warning("No GEMINI_API_KEY found. LLM calls will fail.")
-            return "API Key Missing"
-
-        logger.info("Calling Gemini", role=role, model=model)
+    async def chat(cls, model_id: str, messages: list[dict], temperature: float = 0.3):
+        """
+        Generic chat method. 
+        model_id examples:
+        - gemini/gemini-1.5-pro
+        - deepseek/deepseek-chat
+        - openai/gpt-4o
+        """
+        logger.info("Calling LLM", model=model_id)
         
         try:
             response = await acompletion(
-                model=model,
+                model=model_id,
                 messages=messages,
                 temperature=temperature,
-                api_key=api_key
+                max_tokens=8192
             )
             return response.choices[0].message.content
         except Exception as e:
-            logger.error("Gemini call failed", error=str(e))
+            logger.error("LLM call failed", model=model_id, error=str(e))
             raise e

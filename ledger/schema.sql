@@ -3,6 +3,8 @@ CREATE TABLE IF NOT EXISTS release_arcs (
     issue_id TEXT NOT NULL,
     repository TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'planning', -- planning, in_progress, completed, failed
+    repo_context TEXT,
+    discovery_report TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -25,6 +27,7 @@ CREATE TABLE IF NOT EXISTS gate_reviews (
     gate_name TEXT NOT NULL, -- review_plan, review_design, codereview, review_code
     model_id TEXT NOT NULL,
     status TEXT NOT NULL, -- approved, rejected
+    error_type TEXT, -- systematic, omission, incoherent
     critique_summary TEXT,
     attempt_number INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

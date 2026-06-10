@@ -1,9 +1,9 @@
 import json
-from typing import Any, List
+from typing import Any, List, Optional
 from pydantic import BaseModel
 from .base import BaseAgent, AgentResult
 from .prompts import SUPERVISOR_PROMPT
-from integrations.gemini_client import GeminiClient
+from integrations.gemini_client import LLMClient
 import structlog
 
 logger = structlog.get_logger()
@@ -11,6 +11,7 @@ logger = structlog.get_logger()
 class TaskDefinition(BaseModel):
     id: str
     description: str
+    target_file: Optional[str] = None
     dependencies: List[str] = []
 
 class SupervisorPlan(BaseModel):
@@ -21,17 +22,26 @@ class SupervisorAgent(BaseAgent):
     
     async def invoke(self, context: dict[str, Any], input_data: str) -> AgentResult:
         """
-        Input: Jira/GitLab Issue description.
-        Output: A decomposed list of atomic tasks (Release Arc).
+        Input: Task description.
+        Output: A decomposed list of atomic tasks.
         """
-        logger.info("Supervisor decomposing issue", issue=input_data[:50])
+        logger.info("Supervisor decomposing task", task=input_data[:50])
+        
+        guidelines = context.get("guidelines", "Follow professional best practices for the given task domain.")
+        repo_context = context.get("repo_context", "No repository context provided.")
+        discovery_report = context.get("discovery_report", "No discovery report provided.")
+        system_prompt = SUPERVISOR_PROMPT.format(
+            guidelines=guidelines, 
+            repo_context=repo_context, 
+            discovery_report=discovery_report
+        )
         
         messages = [
-            {"role": "system", "content": SUPERVISOR_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Please decompose this requirement into tasks: {input_data}"}
         ]
         
-        raw_response = await GeminiClient.chat(role="supervisor", messages=messages)
+        raw_response = await LLMClient.chat(model_id=self.model_id, messages=messages)
         
         try:
             # Clean possible markdown code blocks if the model includes them
@@ -43,16 +53,25 @@ class SupervisorAgent(BaseAgent):
             logger.error("Failed to parse supervisor plan", error=str(e), raw=raw_response)
             return AgentResult(success=False, output=f"Parsing error: {str(e)}")
     
-    async def revise_plan(self, plan: SupervisorPlan, critique: str) -> AgentResult:
+    async def revise_plan(self, plan: SupervisorPlan, critique: str, context: dict[str, Any] = {}) -> AgentResult:
         """Revise the plan based on gatekeeper feedback."""
         logger.info("Supervisor revising plan based on critique")
         
+        guidelines = context.get("guidelines", "Follow professional best practices for the given task domain.")
+        repo_context = context.get("repo_context", "No repository context provided.")
+        discovery_report = context.get("discovery_report", "No discovery report provided.")
+        system_prompt = SUPERVISOR_PROMPT.format(
+            guidelines=guidelines, 
+            repo_context=repo_context, 
+            discovery_report=discovery_report
+        )
+        
         messages = [
-            {"role": "system", "content": SUPERVISOR_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Your previous plan was rejected. Critique: {critique}. Original plan: {plan.json()}. Please provide a revised plan in JSON format."}
         ]
         
-        raw_response = await GeminiClient.chat(role="supervisor", messages=messages)
+        raw_response = await LLMClient.chat(model_id=self.model_id, messages=messages)
         try:
             clean_json = raw_response.strip().replace("```json", "").replace("```", "").strip()
             plan_data = json.loads(clean_json)
