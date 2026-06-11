@@ -475,11 +475,23 @@ if __name__ == "__main__":
                 print("❌ Issue ID is required.")
                 sys.exit(1)
             
-            print("\nDescribe the overarching task or feature requirements:")
-            issue_desc = input("Task Description: ").strip()
-            if not issue_desc:
-                print("❌ Task Description is required.")
-                sys.exit(1)
+            # Check if resuming before asking for description
+            plan_file = os.path.join(metadata_dir, f"PLAN_{issue_id}.md")
+            issue_desc = ""
+            
+            if os.path.exists(plan_file):
+                print(f"📄 Existing plan found. Resuming execution for {issue_id}...")
+                # We extract the original description from the markdown file
+                with open(plan_file, "r") as f:
+                    content = f.read()
+                    if "## Original Requirement\n" in content:
+                        issue_desc = content.split("## Original Requirement\n")[1].split("## Execution Tasks")[0].strip()
+            else:
+                print("\nDescribe the overarching task or feature requirements:")
+                issue_desc = input("Task Description: ").strip()
+                if not issue_desc:
+                    print("❌ Task Description is required.")
+                    sys.exit(1)
                 
             await orch.process_issue(issue_id, issue_desc)
         except KeyboardInterrupt:
