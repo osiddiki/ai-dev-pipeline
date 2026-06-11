@@ -503,14 +503,33 @@ if __name__ == "__main__":
     async def run():
         try:
             print("\n" + "="*50 + "\n🚀 GATE PIPELINE ORCHESTRATOR\n" + "="*50)
-            target_repo = input(f"\nEnter Target Repo Path [current dir]: ").strip() or "."
+            
+            # SESSION PERSISTENCE: Check for last used repo and ID
+            session_file = "metadata/LAST_SESSION.json"
+            target_repo = None
+            issue_id = None
+            
+            if os.path.exists(session_file):
+                with open(session_file, "r") as f:
+                    last_session = json.load(f)
+                    
+                resume_input = input(f"\n🔄 Continue from last session?\n   Repo: {last_session.get('repo')}\n   Issue: {last_session.get('issue_id')}\n   [Y/n]: ").strip().lower()
+                
+                if resume_input != 'n':
+                    target_repo = last_session.get('repo')
+                    issue_id = last_session.get('issue_id')
+            
+            if not target_repo:
+                target_repo = input(f"\nEnter Target Repo Path [current dir]: ").strip() or "."
             
             project_name = os.path.basename(target_repo.rstrip("/"))
             metadata_dir = f"metadata/{project_name}"
+            os.makedirs(metadata_dir, exist_ok=True)
             
             # Decoupled Configuration Loading (Centralized)
             config_path = os.path.join(metadata_dir, "gate.yml")
             project_guidelines = "Follow standard engineering best practices."
+            orch_protected_paths = None
             if os.path.exists(config_path):
                 print(f"📄 Loaded project configuration from {config_path}")
                 with open(config_path, "r") as f:
@@ -522,17 +541,21 @@ if __name__ == "__main__":
                 project_guidelines += f"CONSTRAINTS:\n{gate_cfg.get('constraints', '')}\n\n"
                 project_guidelines += f"PROJECT GUIDELINES:\n{gate_cfg.get('guidelines', '')}"
                 
-                # Dynamic Protected Paths
                 orch_protected_paths = gate_cfg.get('protected_paths', ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"])
             else:
                 print(f"⚠️  No gate.yml found in {metadata_dir}. Operating with generic default guidelines.")
-                orch_protected_paths = None
 
             orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines, protected_paths=orch_protected_paths)
-            issue_id = input("\nEnter Issue ID [e.g. TICKET-123]: ").strip()
+            
             if not issue_id:
-                print("❌ Issue ID is required.")
-                sys.exit(1)
+                issue_id = input("\nEnter Issue ID [e.g. TICKET-123]: ").strip()
+                if not issue_id:
+                    print("❌ Issue ID is required.")
+                    sys.exit(1)
+            
+            # SAVE CURRENT SESSION
+            with open(session_file, "w") as f:
+                json.dump({"repo": target_repo, "issue_id": issue_id}, f)
             
             # Check if resuming before asking for description
             plan_file = os.path.join(metadata_dir, f"PLAN_{issue_id}.md")
