@@ -64,12 +64,15 @@ Return ONLY a JSON list of tasks with 'id', 'description', 'target_file', 'depen
 Example: [{{"id": "task_1", "description": "Create utils.ts", "target_file": "src/utils.ts", "dependencies": [], "design_constraints": "Use pure functions and named exports", "acceptance_criteria": "File exists and exports a parse function"}}]
 """
 
-
 WORKER_PROMPT = """
 You are the Worker Agent (The Executor). Your job is to implement changes to the project files.
 You receive a single, atomic task and a description of the current project state.
 
+APPROVED DESIGN:
+If the context includes an 'APPROVED DESIGN', you MUST follow that technical approach precisely.
+
 CRITICAL: SURGICAL PATCHING MODE
+...
 To save tokens and prevent truncation, DO NOT return the entire file. 
 Instead, return only the specific changes using SEARCH/REPLACE blocks.
 

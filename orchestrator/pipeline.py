@@ -85,37 +85,63 @@ class ReleaseArcOrchestrator:
         return full_context
 
     def apply_patches(self, current_content: str, response: str) -> str:
-        """Parse and apply SEARCH/REPLACE blocks with flexible separator support."""
-        # Use a more forgiving regex that handles optional newlines around empty search blocks
-        pattern = re.compile(r"<<<< SEARCH\s*(.*?)\s*={4,}\s*(.*?)\s*>>>> REPLACE", re.DOTALL)
-        blocks = pattern.findall(response)
+        """Surgically extract and apply SEARCH/REPLACE blocks using robust string parsing."""
+        new_content = current_content
         
-        def clean_fallback(text: str) -> str:
-            text = re.sub(r"<<<< SEARCH\s*", "", text)
-            text = re.sub(r"={4,}\s*", "", text)
-            text = re.sub(r">>>> REPLACE\s*", "", text)
-            return text.strip()
-            
-        if not blocks:
+        # 1. Split by '>>>> REPLACE' to get potential blocks
+        raw_blocks = response.split(">>>> REPLACE")
+        
+        applied_any = False
+        for raw_block in raw_blocks:
+            if "<<<< SEARCH" not in raw_block:
+                continue
+                
+            try:
+                # Extract the chunk between <<<< SEARCH and the end of this raw_block
+                parts = raw_block.split("<<<< SEARCH")
+                block_body = parts[1] # Content after the tag
+                
+                # Split the body into SEARCH and REPLACE sections at the ======= marker
+                # We use a regex for the middle marker to be flexible with equals count
+                sections = re.split(r"\n={4,}\n", block_body)
+                if len(sections) < 2:
+                    # Try splitting without newlines if AI was sloppy
+                    sections = re.split(r"={4,}", block_body)
+                
+                if len(sections) >= 2:
+                    search_text = sections[0].strip()
+                    replace_text = sections[1].strip()
+                    
+                    # Handle new file / complete overwrite
+                    if not search_text and not new_content.strip():
+                        new_content = replace_text
+                        applied_any = True
+                    elif search_text in new_content:
+                        new_content = new_content.replace(search_text, replace_text)
+                        applied_any = True
+                    else:
+                        logger.warning("SEARCH block match failed", search_preview=search_text[:50])
+            except Exception as e:
+                logger.error("Failed to parse individual block", error=str(e))
+
+        # 2. FALLBACK: If no markers were parsed, try to extract a clean code block
+        if not applied_any:
+            content = response
             if "```" in response:
+                # Extract first code block
                 parts = response.split("```")
                 if len(parts) >= 3:
-                    inner = parts[1]
-                    inner = inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
-                    return clean_fallback(inner)
-            return clean_fallback(response)
+                    content = parts[1]
+                    # Strip language identifier (e.g., 'typescript')
+                    if "\n" in content:
+                        content = content.split("\n", 1)[1]
             
-        new_content = current_content
-        for search, replace in blocks:
-            # Handle empty search block (creating a new file or completely overwriting)
-            if not search.strip():
-                new_content = replace
-            else:
-                if search in new_content:
-                    new_content = new_content.replace(search, replace)
-                else:
-                    logger.error("SEARCH block match failed", search_preview=search[:50])
-                    raise ValueError(f"Surgical patch failed: Could not find exact match for SEARCH block in the file.")
+            # Final safety: Forcefully strip any hallucinated tags that might remain
+            content = re.sub(r"<<<< SEARCH\s*", "", content)
+            content = re.sub(r"={4,}\s*", "", content)
+            content = re.sub(r">>>> REPLACE\s*", "", content)
+            return content.strip()
+
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
@@ -315,13 +341,20 @@ class ReleaseArcOrchestrator:
                     temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies, design_constraints=task.design_constraints, acceptance_criteria=task.acceptance_criteria)
                     
                     # Ensure Worker proposes a design before execution
-                    design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=[{"role": "user", "content": f"Task: {temp_task.description}\nConstraints: {temp_task.design_constraints}\nProvide a brief technical design proposal for this task."}])
+                    design_request = f"Task: {temp_task.description}\nConstraints: {temp_task.design_constraints}\n"
+                    design_request += "Provide a detailed technical design proposal for this task. Include specific class names, function signatures, and logic steps. "
+                    design_request += "Your proposal will be reviewed by a Senior Architect, and then used by a Worker to implement the code."
+                    
+                    design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=[{"role": "user", "content": design_request}])
                     
                     design_gate = await self.gatekeeper.review_design(temp_task, design_proposal)
                     if not design_gate.approved: 
                         print(f"⚠️  Design check failed for {task.id}. Self-healing...")
                         last_error_feedback = f"Design Rejected: {design_gate.critique}"
                         continue
+                    
+                    # Inject approved design into context for the worker
+                    context["approved_design"] = design_proposal
                     
                     # TEMPERATURE ESCALATION
                     retry_temp = 0.3 + (task_attempt - 1) * 0.2

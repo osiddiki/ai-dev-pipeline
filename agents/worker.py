@@ -57,9 +57,17 @@ class WorkerAgent(BaseAgent):
         
         # 2. Call the LLM to generate the solution
         task_memory = context.get("task_memory", "")
+        approved_design = context.get("approved_design", "")
+        
+        user_msg = f"TECHNICAL DISCOVERY REPORT:\n{discovery_report}\n\nPROJECT MEMORY (PREVIOUS ANALYSES):\n{task_memory}\n\n"
+        if approved_design:
+            user_msg += f"APPROVED DESIGN:\n{approved_design}\n\n"
+            
+        user_msg += f"Repo State:\n{repo_state}\n\nCurrent File Content ({file_to_read}):\n{current_content}\n\nTask: {input_data.description}"
+        
         messages = [
             {"role": "system", "content": WORKER_PROMPT},
-            {"role": "user", "content": f"TECHNICAL DISCOVERY REPORT:\n{discovery_report}\n\nPROJECT MEMORY (PREVIOUS ANALYSES):\n{task_memory}\n\nRepo State:\n{repo_state}\n\nCurrent File Content ({file_to_read}):\n{current_content}\n\nTask: {input_data.description}"}
+            {"role": "user", "content": user_msg}
         ]
         
         raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, temperature=temperature)
