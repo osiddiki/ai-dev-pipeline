@@ -274,13 +274,14 @@ class ReleaseArcOrchestrator:
                 while task_attempt < max_task_attempts:
                     task_attempt += 1
                     
-                    # GIT ROLLBACK: Ensure pristine state for each attempt
+                    # GIT ROLLBACK: Ensure pristine state for each attempt (Graceful fallback if not a git repo)
                     print(f"🧹 Resetting workspace to pristine state...")
-                    await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, "git reset --hard HEAD && git clean -fd")
+                    rollback_cmd = "if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then git reset --hard HEAD && git clean -fd; else echo 'Not a git repo, skipping rollback'; fi"
+                    await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, rollback_cmd)
 
                     # Strike-Two Breakout: Ask human for hint after 2 fails
                     if task_attempt == 3 and not task_success:
-                        print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: The AI is stuck on {task.id}\nCRITIQUE: {last_error_feedback[:300]}\n" + "!"*60)
+                        print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: The AI is stuck on {task.id}\nCRITIQUE: {last_error_feedback[:500]}\n" + "!"*60)
                         user_hint = input("\nProvide a strategic hint to break the loop, or type 'skip': ").strip()
                         if user_hint.lower() == 'skip':
                             task_success = True
@@ -300,10 +301,15 @@ class ReleaseArcOrchestrator:
                         print(f"🔄 Retrying {task.id} with self-healing feedback...")
                         mission_desc += f"\n\nPREVIOUS FAILURE FEEDBACK:\n{last_error_feedback}"
                     
-                    temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies)
-                    design_gate = await self.gatekeeper.review_design(temp_task, f"Design for {temp_task.id}")
+                    temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies, design_constraints=task.design_constraints, acceptance_criteria=task.acceptance_criteria)
+                    
+                    # Ensure Worker proposes a design before execution
+                    design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=[{"role": "user", "content": f"Task: {temp_task.description}\nConstraints: {temp_task.design_constraints}\nProvide a brief technical design proposal for this task."}])
+                    
+                    design_gate = await self.gatekeeper.review_design(temp_task, design_proposal)
                     if not design_gate.approved: 
                         print(f"⚠️  Design check failed for {task.id}. Self-healing...")
+                        last_error_feedback = f"Design Rejected: {design_gate.critique}"
                         continue
                     
                     # TEMPERATURE ESCALATION
