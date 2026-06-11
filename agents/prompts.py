@@ -61,7 +61,7 @@ OUTPUT FORMAT:
 Return ONLY a JSON list of tasks with 'id', 'description', 'target_file', 'dependencies', 'design_constraints', and 'acceptance_criteria'.
 'design_constraints' MUST explain exactly HOW the code should be structured.
 'acceptance_criteria' MUST explain exactly HOW to prove the task is complete.
-Example: [{"id": "task_1", "description": "Create utils.ts", "target_file": "src/utils.ts", "dependencies": [], "design_constraints": "Use pure functions and named exports", "acceptance_criteria": "File exists and exports a parse function"}]
+Example: [{{"id": "task_1", "description": "Create utils.ts", "target_file": "src/utils.ts", "dependencies": [], "design_constraints": "Use pure functions and named exports", "acceptance_criteria": "File exists and exports a parse function"}}]
 """
 
 
