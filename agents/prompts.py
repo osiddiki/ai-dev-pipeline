@@ -186,16 +186,16 @@ GOAL:
 Output a JSON verification plan. 
 
 CRITICAL RULES:
-1. CONSERVATIVE TESTING: For initialization tasks (creating package.json, tsconfig.json, or new directories), DO NOT run heavy commands like 'npm install' or 'npm build'. Instead, use simple existence checks (e.g., 'test -f path/to/file').
-2. ANALYSIS TASKS: If the task is purely an "Analysis" or "Design Review" task (no files are being modified or created), you MUST set fallback_mode to 'fail' and provide an empty commands list. You cannot test an analysis document.
-3. SUB-DIRECTORY AWARENESS: Always include the full path in your commands or use 'cd folder && command'.
+1. NO HEAVY COMMANDS: You are strictly FORBIDDEN from using 'npm install', 'pnpm install', 'pip install', or any 'build'/'compile' commands that target the whole project. These fail in early-stage projects.
+2. EXISTENCE CHECKS ONLY: For all implementation tasks, your default command must be 'test -f path/to/file'. 
+3. EXPORT CHECKS: If a task says it 'exports' something, use 'grep' to verify the export exists (e.g., 'grep "export interface X" path/to/file').
 4. NO USER PROMPTS: NEVER suggest user interaction.
-5. FALLBACK: If no heavy test is appropriate, default to 'syntax_check'.
+5. FALLBACK: If you cannot find a file path to test, set fallback_mode to 'fail'.
 
 OUTPUT FORMAT:
 Return ONLY a JSON object:
 {
-  "commands": ["test -f path/to/file"],
+  "commands": ["test -f path/to/file", "grep \"export interface\" path/to/file"],
   "success_criteria": {"type": "exit_code_zero"},
   "fallback_mode": "syntax_check"
 }

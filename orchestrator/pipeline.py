@@ -558,13 +558,21 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"\n💥 STARTUP ERROR: {str(e)}")
         finally:
-            pending = asyncio.all_tasks()
-            for task in pending:
-                if task is not asyncio.current_task(): task.cancel()
+            # CLEAN SHUTDOWN: Wait for background tasks to finish
             try:
-                await asyncio.wait_for(asyncio.gather(*[p for p in pending if p is not asyncio.current_task()], return_exceptions=True), timeout=2.0)
-            except Exception: pass
-            loop = asyncio.get_event_loop()
-            await loop.shutdown_asyncgens()
-            print("✨ Resources released.")
+                pending = asyncio.all_tasks()
+                for task in pending:
+                    if task is not asyncio.current_task(): task.cancel()
+                
+                # Give tasks a moment to cancel
+                if pending:
+                    await asyncio.gather(*[p for p in pending if p is not asyncio.current_task()], return_exceptions=True)
+                
+                loop = asyncio.get_event_loop()
+                await loop.shutdown_asyncgens()
+                # Do NOT close the loop here, asyncio.run handles that
+                print("✨ Resources released.")
+            except Exception as shutdown_err:
+                # Silence final shutdown noise
+                pass
     asyncio.run(run())
