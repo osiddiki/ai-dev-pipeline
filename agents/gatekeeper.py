@@ -15,6 +15,7 @@ class GateResult(BaseModel):
     approved: bool
     error_type: Optional[str] = None # systematic, omission, incoherent
     critique: str
+    confidence: float = 1.0
     metrics: dict[str, int] = {}
 
 class GatekeeperAgent(BaseAgent):
@@ -50,12 +51,13 @@ class GatekeeperAgent(BaseAgent):
                 approved=report.approved, 
                 error_type=report.primary_failure_mode if report.primary_failure_mode != "none" else None, 
                 critique=critique, 
+                confidence=report.confidence,
                 metrics=metrics
             )
         except Exception as e:
             logger.error("Failed to parse structured gatekeeper response", error=str(e), raw=raw_response)
             # Fallback for parsing failure
-            return GateResult(approved=False, error_type="incoherent", critique=f"Gatekeeper parsing failure: {raw_response}", metrics=metrics)
+            return GateResult(approved=False, error_type="incoherent", critique=f"Gatekeeper parsing failure: {raw_response}", confidence=0.0, metrics=metrics)
 
     async def review_design(self, task: TaskDefinition, proposed_design: str) -> GateResult:
         """Gate 2: Pre-code technical approach validation."""
