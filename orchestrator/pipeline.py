@@ -75,6 +75,7 @@ class ReleaseArcOrchestrator:
                     docs_content.append(f"--- REPOWISE: {rw_file} ---\n{rw_content[:3000]}")
 
         # 5. HUMAN RULINGS & PROJECT SOPs (Context Priming)
+        # Read from centralized metadata storage
         rulings_local_path = f"{self.metadata_dir}/RULINGS.md"
         if os.path.exists(rulings_local_path):
             with open(rulings_local_path, "r") as f:
@@ -131,6 +132,8 @@ class ReleaseArcOrchestrator:
                     # FUZZY/NORMALIZED FALLBACK
                     norm_search = normalize(s_text)
                     if norm_search:
+                        # Attempt to find the block by ignoring all whitespace
+                        # We use a regex that ignores all whitespace between characters
                         pattern_str = r"\s*".join(re.escape(c) for c in s_text if not c.isspace())
                         try:
                             match = re.search(pattern_str, new_content, re.DOTALL)
@@ -150,12 +153,14 @@ class ReleaseArcOrchestrator:
             elif in_replace:
                 replace_lines.append(line)
 
+        # FALLBACK: If state machine failed to apply any patches, try to extract a raw code block
         if not applied_any:
             if "```" in response:
                 parts = response.split("```")
                 if len(parts) >= 3:
                     inner = parts[1]
                     content = inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
+                    # SCRUBBER: Forcefully remove tags if they bled into the code block
                     content = re.sub(r"<<<< SEARCH\s*", "", content)
                     content = re.sub(r"={4,}\s*", "", content)
                     content = re.sub(r">>>> REPLACE\s*", "", content)
@@ -165,7 +170,7 @@ class ReleaseArcOrchestrator:
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
-        """Process a task through the GATE framework with Transactional Commit."""
+        """Process a task through the GATE framework with Deterministic Task Tracking."""
         db = await get_db()
         
         # MIGRATION: Add task_id column if it doesn't exist
@@ -179,7 +184,7 @@ class ReleaseArcOrchestrator:
         arc_id = None
         
         try:
-            # Arc Loading
+            # CHECKPOINT: Arc Loading
             repo_context = None
             discovery_report = None
             async with db.execute(
@@ -295,7 +300,6 @@ class ReleaseArcOrchestrator:
             
             print(f"🚦 Execution queue: {[t.id for t in resolved]}")
 
-            all_diffs = []
             task_memory = ""
             for i, task in enumerate(resolved):
                 print(f"\n" + "-"*40 + f"\n⚡ TASK {i+1}/{len(resolved)}: {task.id}\n" + "-"*40)
@@ -342,6 +346,13 @@ class ReleaseArcOrchestrator:
                     
                     temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies, design_constraints=task.design_constraints, acceptance_criteria=task.acceptance_criteria)
                     
+                    # CONTEXT UPGRADE: Always inject package.json if it exists
+                    pkg_path = f"{self.target_repo}/test-data-generator/package.json"
+                    if os.path.exists(pkg_path):
+                        with open(pkg_path, "r") as f:
+                            pkg_content = f.read()
+                        task_memory += f"\n--- CURRENT package.json ---\n{pkg_content}\n"
+                    
                     # Task Record (Initialize attempt)
                     await db.execute("INSERT INTO tasks (arc_id, task_id, description, status) VALUES (?, ?, ?, 'in_progress')", (arc_id, task.id, task.description))
                     await db.commit()
@@ -365,6 +376,7 @@ class ReleaseArcOrchestrator:
                     context["task_memory"] = task_memory
                     
                     # Gate 3: Code Review
+                    print(f"🛡️  The Gatekeeper is performing code review...")
                     cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
                     if cr_gate.approved and cr_gate.confidence < self.config.min_gate_confidence:
                         cr_gate.approved = False
@@ -398,20 +410,29 @@ class ReleaseArcOrchestrator:
                                         lint_out, lint_code = await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, linter_cmd)
                                         if lint_code != 0:
                                             if os.path.exists(tmp_path_host): os.remove(tmp_path_host)
-                                            raise ValueError(f"Linter failed:\n{lint_out}")
+                                            raise ValueError(f"Linter failed on .tmp file:\n{lint_out}")
 
-                                    # SUCCESS: Commit to both host and sandbox
-                                    # We use sandbox.write_file to ensure the container sees the file immediately
-                                    sandbox.write_file(task.target_file, updated_content)
+                                    # REALITY CHECK (Rename THEN verify)
                                     os.rename(tmp_path_host, filepath)
+                                    # Sync to Sandbox
+                                    DockerSandbox(self.target_repo).write_file(task.target_file, updated_content)
                                     
-                                    print(f"✨ Task {task.id} passed all gates.")
-                                    all_diffs.append(w_output)
-                                    await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
-                                    await db.commit()
-                                    await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, f"git add . && git commit -m 'GATE: {task.id}'")
-                                    task_success = True
-                                    break
+                                    verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
+                                    verification = await verifier.verify(temp_task.description, repo_context, [task.target_file])
+                                    
+                                    if not verification.success:
+                                        print(f"❌ Reality check failed: {verification.reason}")
+                                        cr_gate.approved = False
+                                        cr_gate.critique += f"\n\nEMPIRICAL FAILURE: {verification.reason}"
+                                        last_error_feedback = cr_gate.critique
+                                    else:
+                                        print(f"✨ Task {task.id} passed all gates.")
+                                        all_diffs.append(w_output)
+                                        await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
+                                        await db.commit()
+                                        await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, f"git add . && git commit -m 'GATE: {task.id}'")
+                                        task_success = True
+                                        break
                                 except Exception as e:
                                     last_error_feedback = f"Execution failed: {str(e)}"
                                     cr_gate.approved = False
