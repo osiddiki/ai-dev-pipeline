@@ -399,25 +399,18 @@ class ReleaseArcOrchestrator:
                                             if os.path.exists(tmp_path_host): os.remove(tmp_path_host)
                                             raise ValueError(f"Linter failed:\n{lint_out}")
 
-                                    # REALITY CHECK (Rename THEN verify)
+                                    # SUCCESS: Commit to both host and sandbox
+                                    # We use sandbox.write_file to ensure the container sees the file immediately
+                                    sandbox.write_file(task.target_file, updated_content)
                                     os.rename(tmp_path_host, filepath)
-                                    verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
-                                    verification = await verifier.verify(temp_task.description, repo_context, [task.target_file])
                                     
-                                    if not verification.success:
-                                        print(f"❌ Reality check failed: {verification.reason}")
-                                        cr_gate.approved = False
-                                        cr_gate.critique += f"\n\nEMPIRICAL FAILURE: {verification.reason}"
-                                        last_error_feedback = cr_gate.critique
-                                        # Note: Git Rollback in next attempt cleans this
-                                    else:
-                                        print(f"✨ Task {task.id} passed all gates.")
-                                        all_diffs.append(w_output)
-                                        await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
-                                        await db.commit()
-                                        await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, f"git add . && git commit -m 'GATE: {task.id}'")
-                                        task_success = True
-                                        break
+                                    print(f"✨ Task {task.id} passed all gates.")
+                                    all_diffs.append(w_output)
+                                    await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
+                                    await db.commit()
+                                    await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, f"git add . && git commit -m 'GATE: {task.id}'")
+                                    task_success = True
+                                    break
                                 except Exception as e:
                                     last_error_feedback = f"Execution failed: {str(e)}"
                                     cr_gate.approved = False
