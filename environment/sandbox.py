@@ -62,7 +62,14 @@ class DockerSandbox:
             container.remove()
             
             if exit_code != 0:
-                logger.error("Sandbox execution failed", exit_code=exit_code)
+                # EXIT CODE GUIDE:
+                # 1: General error or 'False' result (e.g. test -f failed, grep found nothing)
+                # 2: File not found or Shell error
+                # 127: Command not found (REAL ERROR)
+                if exit_code in [1, 2]:
+                    logger.info("Sandbox command returned non-zero (often expected)", exit_code=exit_code)
+                else:
+                    logger.error("Sandbox execution failed", exit_code=exit_code)
                 
             return output, exit_code
         except Exception as e:
