@@ -6,6 +6,7 @@ from .supervisor import TaskDefinition
 from .prompts import WORKER_PROMPT
 from integrations.gemini_client import LLMClient
 from environment.sandbox import DockerSandbox
+from orchestrator.verifier import VerifierEngine
 import structlog
 
 logger = structlog.get_logger()
@@ -72,13 +73,17 @@ class WorkerAgent(BaseAgent):
         
         raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, temperature=temperature)
         
-        # 3. Validation Phase
-        validation_output = "No validation performed."
+        # 3. Validation Phase (Real autonomous verification)
+        validation_output = "No specific file targeted for validation."
         if file_to_read:
-            if file_to_read.endswith(".tex"):
-                validation_output = "LaTeX content updated and verified for macro integrity."
-            elif file_to_read.endswith(".py"):
-                validation_output = "Python syntax check passed."
+            logger.info("Worker running local verification", file=file_to_read)
+            verifier = VerifierEngine(sandbox=sandbox)
+            # We treat the raw_response as the 'diff' for verification context
+            verification = await verifier.verify(input_data.description, discovery_report, [file_to_read])
+            if verification.success:
+                validation_output = f"VERIFICATION SUCCESS: {verification.reason}"
+            else:
+                validation_output = f"VERIFICATION FAILURE: {verification.reason}\nEVIDENCE:\n{verification.evidence}"
 
         return AgentResult(
             success=True,

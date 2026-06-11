@@ -27,7 +27,8 @@ class ReleaseArcOrchestrator:
         self, 
         target_repo: str, 
         guidelines: Optional[str] = None,
-        config: Optional[GateConfig] = None
+        config: Optional[GateConfig] = None,
+        protected_paths: Optional[List[str]] = None
     ):
         self.target_repo = target_repo
         # Centralized metadata storage
@@ -37,6 +38,7 @@ class ReleaseArcOrchestrator:
         
         self.guidelines = guidelines or "Follow professional best practices."
         self.config = config or GateConfig()
+        self.protected_paths = protected_paths or ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"]
         
         self.supervisor = SupervisorAgent(model_id=self.config.planner_model)
         self.worker = WorkerAgent(model_id=self.config.executor_model)
@@ -85,63 +87,66 @@ class ReleaseArcOrchestrator:
         return full_context
 
     def apply_patches(self, current_content: str, response: str) -> str:
-        """Surgically extract and apply SEARCH/REPLACE blocks using robust string parsing."""
+        """Surgically extract and apply SEARCH/REPLACE blocks using strict line-based markers."""
         new_content = current_content
         
-        # 1. Split by '>>>> REPLACE' to get potential blocks
-        raw_blocks = response.split(">>>> REPLACE")
+        # Strict pattern: markers must be at the start of a line
+        # Regex explanation:
+        # ^<<<< SEARCH\s*(.*?)\s*   - SEARCH tag at start of line
+        # \n={4,}\s*(.*?)\s*        - Separator line
+        # \n>>>> REPLACE            - REPLACE tag at start of line
+        pattern = re.compile(r"^<<<< SEARCH\s*(.*?)\s*\n={4,}\s*(.*?)\s*\n>>>> REPLACE", re.DOTALL | re.MULTILINE)
+        blocks = pattern.findall(response)
         
-        applied_any = False
-        for raw_block in raw_blocks:
-            if "<<<< SEARCH" not in raw_block:
-                continue
-                
-            try:
-                # Extract the chunk between <<<< SEARCH and the end of this raw_block
-                parts = raw_block.split("<<<< SEARCH")
-                block_body = parts[1] # Content after the tag
-                
-                # Split the body into SEARCH and REPLACE sections at the ======= marker
-                # We use a regex for the middle marker to be flexible with equals count
-                sections = re.split(r"\n={4,}\n", block_body)
-                if len(sections) < 2:
-                    # Try splitting without newlines if AI was sloppy
-                    sections = re.split(r"={4,}", block_body)
-                
-                if len(sections) >= 2:
-                    search_text = sections[0].strip()
-                    replace_text = sections[1].strip()
-                    
-                    # Handle new file / complete overwrite
-                    if not search_text and not new_content.strip():
-                        new_content = replace_text
-                        applied_any = True
-                    elif search_text in new_content:
-                        new_content = new_content.replace(search_text, replace_text)
-                        applied_any = True
-                    else:
-                        logger.warning("SEARCH block match failed", search_preview=search_text[:50])
-            except Exception as e:
-                logger.error("Failed to parse individual block", error=str(e))
+        if not blocks:
+            # Fallback 1: Manual string splitting if regex fails (e.g. indentation issues)
+            if "<<<< SEARCH" in response and ">>>> REPLACE" in response:
+                logger.warning("Regex failed to find blocks but tags exist. Falling back to string splitting.")
+                raw_blocks = response.split(">>>> REPLACE")
+                applied_any = False
+                for raw_block in raw_blocks:
+                    if "<<<< SEARCH" not in raw_block: continue
+                    try:
+                        parts = raw_block.split("<<<< SEARCH")
+                        block_body = parts[1]
+                        sections = re.split(r"\n={4,}\n", block_body)
+                        if len(sections) < 2: sections = re.split(r"={4,}", block_body)
+                        if len(sections) >= 2:
+                            search_text, replace_text = sections[0].strip(), sections[1].strip()
+                            if not search_text and not new_content.strip():
+                                new_content = replace_text
+                                applied_any = True
+                            elif search_text in new_content:
+                                new_content = new_content.replace(search_text, replace_text)
+                                applied_any = True
+                    except: pass
+                if applied_any: return new_content
 
-        # 2. FALLBACK: If no markers were parsed, try to extract a clean code block
-        if not applied_any:
+            # Fallback 2: Extract clean markdown block
             content = response
             if "```" in response:
-                # Extract first code block
                 parts = response.split("```")
                 if len(parts) >= 3:
                     content = parts[1]
-                    # Strip language identifier (e.g., 'typescript')
-                    if "\n" in content:
-                        content = content.split("\n", 1)[1]
+                    if "\n" in content: content = content.split("\n", 1)[1]
             
-            # Final safety: Forcefully strip any hallucinated tags that might remain
+            # Failsafe: Forcefully strip tags
             content = re.sub(r"<<<< SEARCH\s*", "", content)
             content = re.sub(r"={4,}\s*", "", content)
             content = re.sub(r">>>> REPLACE\s*", "", content)
             return content.strip()
 
+        for search_text, replace_text in blocks:
+            search_text = search_text.strip()
+            replace_text = replace_text.strip()
+            if not search_text and not new_content.strip():
+                new_content = replace_text
+            elif search_text in new_content:
+                new_content = new_content.replace(search_text, replace_text)
+            else:
+                logger.error("SEARCH block match failed", search_preview=search_text[:50])
+                raise ValueError(f"Surgical patch failed: Could not find exact match for SEARCH block in file.")
+                
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
@@ -379,8 +384,7 @@ class ReleaseArcOrchestrator:
                     if cr_gate.approved:
                         # STAGE THE CHANGE
                         if task.target_file:
-                            PROTECTED_PATHS = ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"]
-                            if any(p in task.target_file for p in PROTECTED_PATHS):
+                            if any(p in task.target_file for p in self.protected_paths):
                                 print(f"🛑 SOURCE GUARD BLOCKED WRITE: {task.target_file}")
                             else:
                                 filepath = f"{self.target_repo}/{task.target_file}"
@@ -486,7 +490,8 @@ class ReleaseArcOrchestrator:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt, verification_method, prompt_t, comp_t)
             )
-        except Exception:
+        except Exception as e:
+             logger.warning("Failed to log rich gate metrics, falling back to simple log", error=str(e))
              await db.execute(
                 """INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -516,10 +521,14 @@ if __name__ == "__main__":
                 project_guidelines += f"ARCHITECTURE:\n{gate_cfg.get('architecture', '')}\n\n"
                 project_guidelines += f"CONSTRAINTS:\n{gate_cfg.get('constraints', '')}\n\n"
                 project_guidelines += f"PROJECT GUIDELINES:\n{gate_cfg.get('guidelines', '')}"
+                
+                # Dynamic Protected Paths
+                orch_protected_paths = gate_cfg.get('protected_paths', ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"])
             else:
                 print(f"⚠️  No gate.yml found in {metadata_dir}. Operating with generic default guidelines.")
+                orch_protected_paths = None
 
-            orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines)
+            orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines, protected_paths=orch_protected_paths)
             issue_id = input("\nEnter Issue ID [e.g. TICKET-123]: ").strip()
             if not issue_id:
                 print("❌ Issue ID is required.")
