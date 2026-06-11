@@ -470,10 +470,17 @@ if __name__ == "__main__":
                 print(f"⚠️  No gate.yml found in {metadata_dir}. Operating with generic default guidelines.")
 
             orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines)
-            issue_id = input("\nEnter Issue ID [GEN-001]: ").strip() or "GEN-001"
+            issue_id = input("\nEnter Issue ID [e.g. TICKET-123]: ").strip()
+            if not issue_id:
+                print("❌ Issue ID is required.")
+                sys.exit(1)
             
-            default_task = "Analyze provider-portal-app/e2e/patient-data.ts and create a standalone types.ts file in a new directory test-data-generator/src/ that includes all necessary interfaces for a Unified Patient Model. Ensure the directory is initialized with a basic package.json."
-            issue_desc = input("\nTask Description: ").strip() or default_task
+            print("\nDescribe the overarching task or feature requirements:")
+            issue_desc = input("Task Description: ").strip()
+            if not issue_desc:
+                print("❌ Task Description is required.")
+                sys.exit(1)
+                
             await orch.process_issue(issue_id, issue_desc)
         except KeyboardInterrupt:
             print("\n👋 Shutdown requested by user.")
