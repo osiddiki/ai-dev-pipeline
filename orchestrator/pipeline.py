@@ -450,8 +450,11 @@ if __name__ == "__main__":
             print("\n" + "="*50 + "\n🚀 GATE PIPELINE ORCHESTRATOR\n" + "="*50)
             target_repo = input(f"\nEnter Target Repo Path [current dir]: ").strip() or "."
             
-            # Decoupled Configuration Loading
-            config_path = os.path.join(target_repo, ".gate.yml")
+            project_name = os.path.basename(target_repo.rstrip("/"))
+            metadata_dir = f"metadata/{project_name}"
+            
+            # Decoupled Configuration Loading (Centralized)
+            config_path = os.path.join(metadata_dir, "gate.yml")
             project_guidelines = "Follow standard engineering best practices."
             if os.path.exists(config_path):
                 print(f"📄 Loaded project configuration from {config_path}")
@@ -464,7 +467,7 @@ if __name__ == "__main__":
                 project_guidelines += f"CONSTRAINTS:\n{gate_cfg.get('constraints', '')}\n\n"
                 project_guidelines += f"PROJECT GUIDELINES:\n{gate_cfg.get('guidelines', '')}"
             else:
-                print("⚠️  No .gate.yml found in target repository. Operating with generic default guidelines.")
+                print(f"⚠️  No gate.yml found in {metadata_dir}. Operating with generic default guidelines.")
 
             orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines)
             issue_id = input("\nEnter Issue ID [GEN-001]: ").strip() or "GEN-001"
