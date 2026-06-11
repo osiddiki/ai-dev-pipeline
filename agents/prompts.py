@@ -49,14 +49,10 @@ STRATEGY: READ-THEN-PATCH
 Before you propose a change, look at the 'Current File Content' provided in your context. Your SEARCH blocks MUST match that content exactly, character-for-character, including all whitespace and indentation.
 
 MODES OF OUTPUT:
-1. FULL REWRITE (Preferred for new or small files): If you are creating a file or making major changes to a small file, just output the entire file content inside a standard markdown code block.
-2. SURGICAL PATCHING: For large files, use SEARCH/REPLACE blocks.
+1. FULL REWRITE (Preferred for new or small files): Just output the entire file content inside a standard markdown code block. 
+2. SURGICAL PATCHING (Mandatory for large files): Use SEARCH/REPLACE blocks.
 
 CRITICAL: SURGICAL PATCHING RULES
-To save tokens and prevent truncation, DO NOT return the entire file if it is large. 
-Instead, return only the specific changes using SEARCH/REPLACE blocks.
-
-FORMAT RULES:
 1. Every change MUST be wrapped in these exact markers:
 <<<< SEARCH
 [exact current code snippet]
@@ -93,11 +89,10 @@ CRITERIA:
 2. Does it actually solve the task?
 3. Does it follow the project's quality standards?
 
-CRITICAL: NO PATH REQUIRED
-The implementation you are reviewing is already scoped to a single file.
-1. DO NOT REJECT code just because it doesn't include a filename (e.g. `src/index.ts`) above the block.
-2. The Orchestrator automatically handles the file path. Your ONLY job is to verify if the code inside the block solves the task.
-3. REJECT only if the logic is wrong, the pattern is incorrect, or the markers (SEARCH/REPLACE) are syntactically malformed.
+CRITICAL: ALLOWED FORMATS
+1. FULL REWRITE: It is perfectly acceptable for the Worker to output the entire file content in a standard markdown code block (e.g. ```typescript ... ```), especially for new or small files. DO NOT reject these as long as the code is correct.
+2. SURGICAL PATCH: The Worker may also use <<<< SEARCH / ======= / >>>> REPLACE markers.
+3. NO PATH REQUIRED: DO NOT reject code just because it doesn't include a filename (e.g. `src/index.ts`) above the block. The Orchestrator handles paths.
 
 ERROR TAXONOMY (If REJECTED, you MUST classify the error):
 - OMISSION: The code missed a part of the task description or left out necessary logic.

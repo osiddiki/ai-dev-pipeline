@@ -164,7 +164,7 @@ class ReleaseArcOrchestrator:
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
-        """Process a task through the GATE framework with Deterministic Task Tracking."""
+        """Process a task through the GATE framework with Transactional Commit."""
         db = await get_db()
         
         # MIGRATION: Add task_id column if it doesn't exist
@@ -178,7 +178,7 @@ class ReleaseArcOrchestrator:
         arc_id = None
         
         try:
-            # CHECKPOINT: Arc Loading
+            # Arc Loading
             repo_context = None
             discovery_report = None
             async with db.execute(
@@ -310,11 +310,11 @@ class ReleaseArcOrchestrator:
                 last_error_feedback = ""
                 current_task_desc = task.description
 
-                await db.execute("INSERT INTO tasks (arc_id, task_id, description, status) VALUES (?, ?, ?, 'in_progress')", (arc_id, task.id, task.description))
-                await db.commit()
-
                 while task_attempt < max_task_attempts:
                     task_attempt += 1
+                    
+                    # GUARD: Prevent re-running if success was just marked
+                    if task_success: break
                     
                     # GIT ROLLBACK
                     rollback_cmd = "git config --global --add safe.directory /workspace || true; if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then git reset --hard HEAD && git clean -fd; fi"
@@ -340,12 +340,17 @@ class ReleaseArcOrchestrator:
                     
                     temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies, design_constraints=task.design_constraints, acceptance_criteria=task.acceptance_criteria)
                     
+                    # Task Record (Initialize attempt)
+                    await db.execute("INSERT INTO tasks (arc_id, task_id, description, status) VALUES (?, ?, ?, 'in_progress')", (arc_id, task.id, task.description))
+                    await db.commit()
+
                     # Gate 2: Design
                     design_request = f"Task: {temp_task.description}\nConstraints: {temp_task.design_constraints}\nProvide a detailed technical design proposal."
                     design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=[{"role": "user", "content": design_request}])
                     design_gate = await self.gatekeeper.review_design(temp_task, design_proposal)
                     if not design_gate.approved: 
                         last_error_feedback = f"Design Rejected: {design_gate.critique}"
+                        await self._log_gate(db, arc_id, task.id, "review_design", False, design_gate.critique, error_type=design_gate.error_type, attempt=task_attempt)
                         continue
                     
                     context["approved_design"] = design_proposal
@@ -391,7 +396,7 @@ class ReleaseArcOrchestrator:
                                         lint_out, lint_code = await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, linter_cmd)
                                         if lint_code != 0:
                                             if os.path.exists(tmp_path_host): os.remove(tmp_path_host)
-                                            raise ValueError(f"Linter failed on .tmp file:\n{lint_out}")
+                                            raise ValueError(f"Linter failed:\n{lint_out}")
 
                                     # REALITY CHECK (Rename THEN verify)
                                     os.rename(tmp_path_host, filepath)
@@ -403,6 +408,7 @@ class ReleaseArcOrchestrator:
                                         cr_gate.approved = False
                                         cr_gate.critique += f"\n\nEMPIRICAL FAILURE: {verification.reason}"
                                         last_error_feedback = cr_gate.critique
+                                        # Note: Git Rollback in next attempt cleans this
                                     else:
                                         print(f"✨ Task {task.id} passed all gates.")
                                         all_diffs.append(w_output)
@@ -417,6 +423,7 @@ class ReleaseArcOrchestrator:
                                     continue
                         else:
                             # Analysis task
+                            print(f"✨ Analysis {task.id} passed.")
                             task_success = True
                             await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
                             await db.commit()
@@ -425,6 +432,7 @@ class ReleaseArcOrchestrator:
                     if not cr_gate.approved:
                         last_error_feedback = cr_gate.critique
                         print(f"❌ Gate rejected: {cr_gate.error_type}")
+                        await self._log_gate(db, arc_id, task.id, "codereview", False, cr_gate.critique, error_type=cr_gate.error_type, attempt=task_attempt, metrics=cr_gate.metrics)
                 
                 if not task_success: return False
                     
@@ -437,6 +445,7 @@ class ReleaseArcOrchestrator:
             
         except Exception as e:
             print(f"\n💥 CRASH: {str(e)}")
+            traceback.print_exc()
             return False
 
     async def _log_gate(self, db, arc_id, task_id, gate_name, approved, critique, error_type=None, attempt=1, verification_method=None, metrics=None):
@@ -448,7 +457,8 @@ class ReleaseArcOrchestrator:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt, verification_method, metrics.get("prompt_tokens",0), metrics.get("completion_tokens",0))
             )
-        except Exception:
+        except Exception as e:
+             logger.warning("Log fail", error=str(e))
              await db.execute("INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt))
         await db.commit()
 
