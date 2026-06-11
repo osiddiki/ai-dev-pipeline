@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS release_arcs (
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     arc_id INTEGER NOT NULL,
+    task_id TEXT, -- e.g. 'task_1'
     description TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', -- pending, in_progress, code_review, completed, failed
     dependencies TEXT, -- JSON list of task IDs
@@ -22,21 +23,21 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE TABLE IF NOT EXISTS gate_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id INTEGER,
-    arc_id INTEGER,
+    arc_id INTEGER NOT NULL,
+    task_id TEXT, -- The string ID like 'task_1'
     gate_name TEXT NOT NULL, -- review_plan, review_design, codereview, review_code
     model_id TEXT NOT NULL,
     status TEXT NOT NULL, -- approved, rejected
-    error_type TEXT, -- systematic, omission, incoherent
+    error_type TEXT, -- omission, systematic, incoherent
     critique_summary TEXT,
     attempt_number INTEGER DEFAULT 1,
     verification_method TEXT,
     prompt_tokens INTEGER,
     completion_tokens INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (task_id) REFERENCES tasks(id),
     FOREIGN KEY (arc_id) REFERENCES release_arcs(id)
 );
+
 
 CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

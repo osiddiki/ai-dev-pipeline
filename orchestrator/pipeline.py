@@ -130,11 +130,8 @@ class ReleaseArcOrchestrator:
                     # FUZZY/NORMALIZED FALLBACK
                     norm_search = normalize(s_text)
                     if norm_search:
-                        # Attempt to find the block by ignoring all whitespace
-                        # We use a regex that ignores all whitespace between characters
                         pattern_str = r"\s*".join(re.escape(c) for c in s_text if not c.isspace())
                         try:
-                            # Search for the pattern in the content
                             match = re.search(pattern_str, new_content, re.DOTALL)
                             if match:
                                 logger.info("FUZZY MATCH SUCCESS: Applied patch despite whitespace differences.")
@@ -152,14 +149,12 @@ class ReleaseArcOrchestrator:
             elif in_replace:
                 replace_lines.append(line)
 
-        # FALLBACK: If state machine failed to apply any patches, try to extract a raw code block
         if not applied_any:
             if "```" in response:
                 parts = response.split("```")
                 if len(parts) >= 3:
                     inner = parts[1]
                     content = inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
-                    # SCRUBBER: Forcefully remove tags if they bled into the code block
                     content = re.sub(r"<<<< SEARCH\s*", "", content)
                     content = re.sub(r"={4,}\s*", "", content)
                     content = re.sub(r">>>> REPLACE\s*", "", content)
@@ -169,8 +164,17 @@ class ReleaseArcOrchestrator:
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
-        """Process a task through the GATE framework with Transactional Commit."""
+        """Process a task through the GATE framework with Deterministic Task Tracking."""
         db = await get_db()
+        
+        # MIGRATION: Add task_id column if it doesn't exist
+        try:
+            await db.execute("ALTER TABLE tasks ADD COLUMN task_id TEXT")
+            await db.commit()
+            logger.info("Migrated database: Added task_id column to tasks table.")
+        except Exception:
+            pass # Column already exists
+            
         arc_id = None
         
         try:
@@ -293,7 +297,8 @@ class ReleaseArcOrchestrator:
             for i, task in enumerate(resolved):
                 print(f"\n" + "-"*40 + f"\n⚡ TASK {i+1}/{len(resolved)}: {task.id}\n" + "-"*40)
                 
-                async with db.execute("SELECT status FROM tasks WHERE arc_id = ? AND description = ? AND status = 'completed'", (arc_id, task.description)) as cursor:
+                # Check for completion by ID (Robust deterministic skip)
+                async with db.execute("SELECT status FROM tasks WHERE arc_id = ? AND task_id = ? AND status = 'completed'", (arc_id, task.id)) as cursor:
                     if await cursor.fetchone():
                         print(f"⏭️  Skipping completed task: {task.id}")
                         continue
@@ -304,12 +309,11 @@ class ReleaseArcOrchestrator:
                 last_error_feedback = ""
                 current_task_desc = task.description
 
-                await db.execute("INSERT INTO tasks (arc_id, description, status) VALUES (?, ?, 'in_progress')", (arc_id, task.description))
+                await db.execute("INSERT INTO tasks (arc_id, task_id, description, status) VALUES (?, ?, ?, 'in_progress')", (arc_id, task.id, task.description))
                 await db.commit()
 
                 while task_attempt < max_task_attempts:
                     task_attempt += 1
-                    # ... rest of task logic ...
                     
                     # GIT ROLLBACK
                     rollback_cmd = "git config --global --add safe.directory /workspace || true; if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then git reset --hard HEAD && git clean -fd; fi"
@@ -376,7 +380,6 @@ class ReleaseArcOrchestrator:
                                     
                                     # LINTER PRE-FLIGHT
                                     ext = os.path.splitext(task.target_file)[1]
-                                    # Sandbox-relative path for the command
                                     tmp_rel_path = os.path.join(os.path.dirname(task.target_file), f".tmp.{os.path.basename(filepath)}")
                                     linter_cmd = None
                                     if ext == ".ts": linter_cmd = f"npx tsc --noEmit {tmp_rel_path}"
@@ -402,7 +405,7 @@ class ReleaseArcOrchestrator:
                                     else:
                                         print(f"✨ Task {task.id} passed all gates.")
                                         all_diffs.append(w_output)
-                                        await db.execute("UPDATE tasks SET status = 'completed' WHERE arc_id = ? AND description = ?", (arc_id, task.description))
+                                        await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
                                         await db.commit()
                                         await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, f"git add . && git commit -m 'GATE: {task.id}'")
                                         task_success = True
@@ -414,7 +417,7 @@ class ReleaseArcOrchestrator:
                         else:
                             # Analysis task
                             task_success = True
-                            await db.execute("UPDATE tasks SET status = 'completed' WHERE arc_id = ? AND description = ?", (arc_id, task.description))
+                            await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
                             await db.commit()
                             break
 
