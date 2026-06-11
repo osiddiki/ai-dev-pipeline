@@ -75,7 +75,6 @@ class ReleaseArcOrchestrator:
                     docs_content.append(f"--- REPOWISE: {rw_file} ---\n{rw_content[:3000]}")
 
         # 5. HUMAN RULINGS & PROJECT SOPs (Context Priming)
-        # Read from centralized metadata storage
         rulings_local_path = f"{self.metadata_dir}/RULINGS.md"
         if os.path.exists(rulings_local_path):
             with open(rulings_local_path, "r") as f:
@@ -87,132 +86,105 @@ class ReleaseArcOrchestrator:
         return full_context
 
     def apply_patches(self, current_content: str, response: str) -> str:
-        """Robust state-machine parser for SEARCH/REPLACE blocks with normalized whitespace fallback."""
+        """Dual-Mode Patching Engine: Supports Atomic Rewrites and Surgical Patches."""
+        # 1. ATOMIC REWRITE DETECTION (Preferred for Reliability)
+        # If there are NO surgical markers but there IS a code block, use the code block as the whole file.
+        if "<<<< SEARCH" not in response and "```" in response:
+            logger.info("ATOMIC REWRITE DETECTED: Extracting full file content from code block.")
+            parts = response.split("```")
+            if len(parts) >= 3:
+                inner = parts[1]
+                # Strip language tag (e.g. 'typescript')
+                content = inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
+                return content
+
+        # 2. SURGICAL PATCHING (State-Machine)
         new_content = current_content
         lines = response.splitlines()
-        
-        in_search = False
-        in_replace = False
-        search_lines = []
-        replace_lines = []
+        in_search, in_replace = False, False
+        search_lines, replace_lines = [], []
         applied_any = False
         
-        def normalize(s): 
-            """Remove all non-essential whitespace for comparison."""
-            return re.sub(r"\s+", "", s)
-            
         for line in lines:
             stripped = line.strip()
             # Lenient tag detection (supports <<<< SEARCH, <SEARCH, SEARCH:, etc.)
             if "SEARCH" in stripped and ("<" in stripped or ":" in stripped):
-                in_search = True
-                search_lines = []
+                in_search, search_lines = True, []
                 continue
             elif in_search and ("====" in stripped or "----" in stripped):
-                in_search = False
-                in_replace = True
-                replace_lines = []
+                in_search, in_replace, replace_lines = False, True, []
                 continue
             elif in_replace and "REPLACE" in stripped and (">" in stripped or ":" in stripped):
                 in_replace = False
-                s_text = "\n".join(search_lines).strip()
-                r_text = "\n".join(replace_lines).strip()
-                
-                # Handle creation or total replacement
-                if not s_text:
-                    if not applied_any:
-                        new_content = r_text
-                    else:
-                        new_content += "\n" + r_text
+                s_text, r_text = "\n".join(search_lines).strip(), "\n".join(replace_lines).strip()
+                if not s_text: # Handle new file
+                    new_content = (new_content + "\n" + r_text) if applied_any else r_text
                     applied_any = True
                 elif s_text in new_content:
                     new_content = new_content.replace(s_text, r_text)
                     applied_any = True
                 else:
-                    # FUZZY/NORMALIZED FALLBACK
-                    norm_search = normalize(s_text)
+                    # FUZZY WHITESPACE FALLBACK
+                    norm_search = re.sub(r"\s+", "", s_text)
                     if norm_search:
-                        # Attempt to find the block by ignoring all whitespace
-                        # We use a regex that ignores all whitespace between characters
                         pattern_str = r"\s*".join(re.escape(c) for c in s_text if not c.isspace())
-                        try:
-                            match = re.search(pattern_str, new_content, re.DOTALL)
-                            if match:
-                                logger.info("FUZZY MATCH SUCCESS: Applied patch despite whitespace differences.")
-                                span = match.span()
-                                new_content = new_content[:span[0]] + r_text + new_content[span[1]:]
-                                applied_any = True
-                                continue
-                        except: pass
-                    
-                    logger.warning("SEARCH block match failed", preview=s_text[:50])
+                        match = re.search(pattern_str, new_content, re.DOTALL)
+                        if match:
+                            span = match.span()
+                            new_content = new_content[:span[0]] + r_text + new_content[span[1]:]
+                            applied_any = True
                 continue
-                
-            if in_search:
-                search_lines.append(line)
-            elif in_replace:
-                replace_lines.append(line)
+            if in_search: search_lines.append(line)
+            elif in_replace: replace_lines.append(line)
 
-        # FALLBACK: If state machine failed to apply any patches, try to extract a raw code block
+        # 3. SCRUBBER FALLBACK (Remove accidental tags from raw text)
         if not applied_any:
-            if "```" in response:
-                parts = response.split("```")
-                if len(parts) >= 3:
-                    inner = parts[1]
-                    content = inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
-                    # SCRUBBER: Forcefully remove tags if they bled into the code block
-                    content = re.sub(r"<<<< SEARCH\s*", "", content)
-                    content = re.sub(r"={4,}\s*", "", content)
-                    content = re.sub(r">>>> REPLACE\s*", "", content)
-                    return content.strip()
-            return response.strip()
+            content = re.sub(r"<<<< SEARCH\s*|={4,}\s*|>>>> REPLACE\s*", "", response).strip()
+            return content
 
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
         """Process a task through the GATE framework with Deterministic Task Tracking."""
         db = await get_db()
-        
-        # MIGRATION: Add task_id column if it doesn't exist
         try:
             await db.execute("ALTER TABLE tasks ADD COLUMN task_id TEXT")
             await db.commit()
-            logger.info("Migrated database: Added task_id column to tasks table.")
-        except Exception:
-            pass # Column already exists
+        except: pass
             
         arc_id = None
+        all_diffs = []
+        task_memory = ""
         
         try:
-            # CHECKPOINT: Arc Loading
-            repo_context = None
-            discovery_report = None
-            async with db.execute(
-                "SELECT id, status, repo_context, discovery_report FROM release_arcs WHERE issue_id = ? AND status != 'completed' ORDER BY id DESC LIMIT 1", 
-                (issue_id,)
-            ) as cursor:
+            # 1. ARC INITIALIZATION
+            async with db.execute("SELECT id, status, repo_context, discovery_report FROM release_arcs WHERE issue_id = ? AND status != 'completed' ORDER BY id DESC LIMIT 1", (issue_id,)) as cursor:
                 row = await cursor.fetchone()
                 if row:
                     arc_id, _, repo_context, discovery_report = row
-                    print(f"🔄 Resuming existing mission: {issue_id}")
+                    print(f"🔄 Resuming session: {issue_id}")
                     await db.execute("UPDATE release_arcs SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (arc_id,))
                 else:
-                    print(f"🎯 Starting new mission: {issue_id}")
+                    print(f"🎯 Starting mission: {issue_id}")
                     cursor = await db.execute("INSERT INTO release_arcs (issue_id, repository, status) VALUES (?, ?, 'planning')", (issue_id, self.target_repo))
                     arc_id = cursor.lastrowid
                 await db.commit()
+
+            # 2. HARDEN GIT REPO (Consultant Recommendation #4)
+            # Ensure an initial commit exists so git reset --hard HEAD works
+            git_init_cmd = "git init && git config --global --add safe.directory /workspace && (git add . && git commit --allow-empty -m 'GATE Initial State' || true)"
+            await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, git_init_cmd)
 
             print(f"🔍 The Scout is gathering intelligence...")
             repo_context = await self.gather_context()
             await db.execute("UPDATE release_arcs SET repo_context = ? WHERE id = ?", (repo_context, arc_id))
             await db.commit()
 
+            # 3. RESEARCH PHASE
             force_research = False
             async with db.execute("SELECT error_type FROM gate_reviews WHERE arc_id = ? ORDER BY id DESC LIMIT 1", (arc_id,) ) as cursor:
                 last_error = await cursor.fetchone()
-                if last_error and last_error[0] == 'incoherent':
-                    print("⚠️  Deep research required...")
-                    force_research = True
+                if last_error and last_error[0] == 'incoherent': force_research = True
 
             if not discovery_report or force_research:
                 print("🧠 The Researcher is studying the codebase...")
@@ -220,34 +192,28 @@ class ReleaseArcOrchestrator:
                 discovery_report = research_result.output
                 await db.execute("UPDATE release_arcs SET discovery_report = ? WHERE id = ?", (discovery_report, arc_id))
                 await db.commit()
-            else:
-                print("📂 Using cached project intelligence.")
-                
-            # META-ANALYSIS LOOP
-            print("🔬 The Meta-Analyzer is reviewing historical data...")
+            
+            # 4. META-ANALYSIS
+            print("🔬 Meta-Analyzer reviewing failures...")
             meta_result = await self.meta_analyzer.invoke({}, db)
             if meta_result.success and meta_result.output:
-                print(f"⚠️  META-WARNING INJECTED: {meta_result.output}")
-                self.guidelines += f"\n\nCRITICAL META-WARNING FROM PAST FAILURES:\n{meta_result.output}\n"
+                print(f"⚠️  META-WARNING: {meta_result.output}")
+                self.guidelines += f"\n\nCRITICAL META-WARNING:\n{meta_result.output}\n"
             
             context = {"guidelines": self.guidelines, "repo_path": self.target_repo, "repo_context": repo_context, "discovery_report": discovery_report}
             
+            # 5. PLANNING PHASE
             plan = None
-            if manual_plan:
-                plan = manual_plan
-            else:
+            if not manual_plan:
                 plan_file = f"{self.metadata_dir}/PLAN_{issue_id}.md"
                 if os.path.exists(plan_file):
-                    print(f"📄 Loading approved plan for {issue_id}...")
-                    with open(plan_file, "r") as f:
-                        content = f.read()
+                    print(f"📄 Loading approved blueprint for {issue_id}...")
+                    with open(plan_file, "r") as f: content = f.read()
                     try:
                         json_str = content.split("```json")[1].split("```")[0].strip()
                         plan_data = json.loads(json_str)
                         plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])
-                    except Exception as e:
-                        logger.error("Plan parsing failed", error=str(e))
-                        plan = None
+                    except: plan = None
                 
                 if not plan:
                     print("🏗️  The Architect is drafting the blueprint...")
@@ -255,34 +221,24 @@ class ReleaseArcOrchestrator:
                     if not plan_result.success: return False
                     plan = plan_result.output
                     
-                    max_revisions = 3
-                    for attempt in range(max_revisions + 1):
-                        print(f"🛡️  The Gatekeeper is reviewing the blueprint (Attempt {attempt+1})...")
+                    for attempt in range(4):
+                        print(f"🛡️  Gatekeeper reviewing blueprint (Attempt {attempt+1})...")
                         plan_gate = await self.gatekeeper.review_plan(issue_description, plan)
                         await self._log_gate(db, arc_id, None, "review_plan", plan_gate.approved, plan_gate.critique, error_type=plan_gate.error_type, attempt=attempt+1, metrics=plan_gate.metrics)
-                        if plan_gate.approved:
-                            print("✅ Blueprint approved.")
-                            break
-                        if attempt < max_revisions:
-                            print(f"❌ Blueprint rejected: {plan_gate.error_type}. Revising...")
-                            revision_result = await self.supervisor.revise_plan(plan, plan_gate.critique, context)
-                            if not revision_result.success: return False
-                            plan = revision_result.output
-                        else:
-                            print("🚫 Blueprint failed final review.")
-                            return False
+                        if plan_gate.approved: break
+                        revision_result = await self.supervisor.revise_plan(plan, plan_gate.critique, context)
+                        plan = revision_result.output
 
                     os.makedirs(os.path.dirname(plan_file), exist_ok=True)
                     with open(plan_file, "w") as f:
                         f.write(f"# Implementation Plan for {issue_id}\n\n## Original Requirement\n{issue_description}\n\n## Execution Tasks\n```json\n{json.dumps([t.model_dump() for t in plan.tasks], indent=2)}\n```\n")
-                    print("\n" + "="*60 + f"\n🛑 PLANNING PAUSE: Draft plan saved to {plan_file}\n" + "="*60 + "\n")
+                    print("\n" + "="*60 + f"\n🛑 PLANNING PAUSE: Blueprint saved to {plan_file}\n" + "="*60 + "\n")
                     return True
 
-            # TOPOLOGICAL SORT
+            # 6. EXECUTION PHASE (Tier 3)
             task_dict = {t.id: t for t in plan.tasks}
             resolved = []
-            visited = set()
-            visiting = set()
+            visited, visiting = set(), set()
             def visit(task_id):
                 if task_id in visited: return True
                 if task_id in visiting: return False
@@ -292,73 +248,55 @@ class ReleaseArcOrchestrator:
                     for dep in task.dependencies:
                         if not visit(dep): return False
                     resolved.append(task)
-                visiting.remove(task_id)
-                visited.add(task_id)
+                visiting.remove(task_id); visited.add(task_id)
                 return True
             for task in plan.tasks:
                 if not visit(task.id): return False
             
             print(f"🚦 Execution queue: {[t.id for t in resolved]}")
 
-            task_memory = ""
             for i, task in enumerate(resolved):
                 print(f"\n" + "-"*40 + f"\n⚡ TASK {i+1}/{len(resolved)}: {task.id}\n" + "-"*40)
-                
-                # Check for completion by ID (Robust deterministic skip)
                 async with db.execute("SELECT status FROM tasks WHERE arc_id = ? AND task_id = ? AND status = 'completed'", (arc_id, task.id)) as cursor:
                     if await cursor.fetchone():
                         print(f"⏭️  Skipping completed task: {task.id}")
                         continue
 
-                max_task_attempts = 3
-                task_attempt = 0
-                task_success = False
-                last_error_feedback = ""
+                max_task_attempts, task_attempt, task_success, last_error_feedback = 3, 0, False, ""
                 current_task_desc = task.description
 
                 while task_attempt < max_task_attempts:
                     task_attempt += 1
-                    
-                    # GUARD: Prevent re-running if success was just marked
                     if task_success: break
                     
-                    # GIT ROLLBACK
-                    rollback_cmd = "git config --global --add safe.directory /workspace || true; if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then git reset --hard HEAD && git clean -fd; fi"
+                    # TRANSACTIONAL ROLLBACK
+                    rollback_cmd = "git config --global --add safe.directory /workspace || true; if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then git reset --hard HEAD && git clean -fdx; fi"
                     await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, rollback_cmd)
 
-                    # Strike-Two Breakout
                     if task_attempt == 3 and not task_success:
                         print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: Stuck on {task.id}\nCRITIQUE: {last_error_feedback[:1000]}\n" + "!"*60)
                         user_hint = input("\nStrategic hint ('skip' to bypass): ").strip()
                         if user_hint.lower() == 'skip':
-                            task_success = True
-                            break
+                            task_success = True; break
                         elif user_hint:
                             current_task_desc += f"\n\nSTRATEGIC HINT: {user_hint}"
                             rulings_path = f"{self.metadata_dir}/RULINGS.md"
-                            with open(rulings_path, "a") as rf:
-                                rf.write(f"\n- **Rule from {task.id}**: {user_hint}\n")
+                            with open(rulings_path, "a") as rf: rf.write(f"\n- **Rule from {task.id}**: {user_hint}\n")
 
                     print(f"🔨 Working on {task.id} (Attempt {task_attempt})...")
                     mission_desc = current_task_desc
-                    if task_attempt > 1:
-                        mission_desc += f"\n\nPREVIOUS FAILURE FEEDBACK:\n{last_error_feedback}"
+                    if task_attempt > 1: mission_desc += f"\n\nPREVIOUS FAILURE FEEDBACK:\n{last_error_feedback}"
                     
                     temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies, design_constraints=task.design_constraints, acceptance_criteria=task.acceptance_criteria)
                     
-                    # CONTEXT UPGRADE: Always inject package.json if it exists
+                    # Context Trimming (Consultant Recommendation #5)
                     pkg_path = f"{self.target_repo}/test-data-generator/package.json"
+                    current_pkg = ""
                     if os.path.exists(pkg_path):
-                        with open(pkg_path, "r") as f:
-                            pkg_content = f.read()
-                        task_memory += f"\n--- CURRENT package.json ---\n{pkg_content}\n"
+                        with open(pkg_path, "r") as f: current_pkg = f.read()
                     
-                    # Task Record (Initialize attempt)
-                    await db.execute("INSERT INTO tasks (arc_id, task_id, description, status) VALUES (?, ?, ?, 'in_progress')", (arc_id, task.id, task.description))
-                    await db.commit()
-
                     # Gate 2: Design
-                    design_request = f"Task: {temp_task.description}\nConstraints: {temp_task.design_constraints}\nProvide a detailed technical design proposal."
+                    design_request = f"Task: {temp_task.description}\nConstraints: {temp_task.design_constraints}\npackage.json:\n{current_pkg}\nProvide technical design."
                     design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=[{"role": "user", "content": design_request}])
                     design_gate = await self.gatekeeper.review_design(temp_task, design_proposal)
                     if not design_gate.approved: 
@@ -367,12 +305,10 @@ class ReleaseArcOrchestrator:
                         continue
                     
                     context["approved_design"] = design_proposal
-                    retry_temp = 0.3 + (task_attempt - 1) * 0.2
-                    worker_res = await self.worker.invoke(context, temp_task, temperature=retry_temp)
+                    worker_res = await self.worker.invoke(context, temp_task, temperature=0.3 + (task_attempt-1)*0.2)
                     w_output: WorkerResult = worker_res.output
                     
-                    if not task.target_file:
-                        task_memory += f"\n--- ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
+                    if not task.target_file: task_memory += f"\n--- ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
                     context["task_memory"] = task_memory
                     
                     # Gate 3: Code Review
@@ -394,6 +330,7 @@ class ReleaseArcOrchestrator:
                                     with open(filepath, "r") as f: existing_content = f.read()
                                 
                                 try:
+                                    # ATOMIC DUAL-MODE PATCHING
                                     updated_content = self.apply_patches(existing_content, w_output.diff)
                                     tmp_path_host = os.path.join(os.path.dirname(filepath), f".tmp.{os.path.basename(filepath)}")
                                     with open(tmp_path_host, "w") as f: f.write(updated_content)
@@ -410,11 +347,9 @@ class ReleaseArcOrchestrator:
                                         lint_out, lint_code = await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, linter_cmd)
                                         if lint_code != 0:
                                             if os.path.exists(tmp_path_host): os.remove(tmp_path_host)
-                                            raise ValueError(f"Linter failed on .tmp file:\n{lint_out}")
+                                            raise ValueError(f"Linter failed:\n{lint_out}")
 
-                                    # REALITY CHECK (Rename THEN verify)
                                     os.rename(tmp_path_host, filepath)
-                                    # Sync to Sandbox
                                     DockerSandbox(self.target_repo).write_file(task.target_file, updated_content)
                                     
                                     verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
@@ -428,19 +363,19 @@ class ReleaseArcOrchestrator:
                                     else:
                                         print(f"✨ Task {task.id} passed all gates.")
                                         all_diffs.append(w_output)
+                                        await db.execute("INSERT INTO tasks (arc_id, task_id, description, status) VALUES (?, ?, ?, 'completed')", (arc_id, task.id, task.description))
                                         await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
                                         await db.commit()
                                         await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, f"git add . && git commit -m 'GATE: {task.id}'")
-                                        task_success = True
-                                        break
+                                        task_success = True; break
                                 except Exception as e:
                                     last_error_feedback = f"Execution failed: {str(e)}"
                                     cr_gate.approved = False
                                     continue
                         else:
-                            # Analysis task
                             print(f"✨ Analysis {task.id} passed.")
                             task_success = True
+                            await db.execute("INSERT INTO tasks (arc_id, task_id, description, status) VALUES (?, ?, ?, 'completed')", (arc_id, task.id, task.description))
                             await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (arc_id, task.id))
                             await db.commit()
                             break
@@ -489,29 +424,24 @@ if __name__ == "__main__":
                 if input(f"\n🔄 Resume {last_session.get('issue_id')}? [Y/n]: ").strip().lower() != 'n':
                     target_repo, issue_id = last_session.get('repo'), last_session.get('issue_id')
             if not target_repo: target_repo = input(f"Target Repo: ").strip() or "."
-            
             project_name = os.path.basename(target_repo.rstrip("/"))
             metadata_dir = f"metadata/{project_name}"
             os.makedirs(metadata_dir, exist_ok=True)
-            
             config_path = os.path.join(metadata_dir, "gate.yml")
             project_guidelines, orch_protected_paths = "Standard practices.", None
             if os.path.exists(config_path):
                 with open(config_path, "r") as f: gate_cfg = yaml.safe_load(f)
                 project_guidelines = f"GOAL: {gate_cfg.get('project_goal', '')}\nSTACK: {gate_cfg.get('technical_stack', '')}\nARCH: {gate_cfg.get('architecture', '')}\nRULES: {gate_cfg.get('guidelines', '')}"
                 orch_protected_paths = gate_cfg.get('protected_paths')
-            
             orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines, protected_paths=orch_protected_paths)
             if not issue_id: issue_id = input("Issue ID: ").strip()
             with open(session_file, "w") as f: json.dump({"repo": target_repo, "issue_id": issue_id}, f)
-            
             plan_file = os.path.join(metadata_dir, f"PLAN_{issue_id}.md")
             issue_desc = ""
             if os.path.exists(plan_file):
                 with open(plan_file, "r") as f: content = f.read()
                 if "## Original Requirement\n" in content: issue_desc = content.split("## Original Requirement\n")[1].split("## Execution Tasks")[0].strip()
-            else:
-                issue_desc = input("Task Description: ").strip()
+            else: issue_desc = input("Task Description: ").strip()
             if not issue_id or not issue_desc: sys.exit(1)
             await orch.process_issue(issue_id, issue_desc)
         except Exception as e: print(f"\n💥 ERROR: {str(e)}")
