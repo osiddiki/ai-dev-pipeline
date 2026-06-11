@@ -48,12 +48,12 @@ If the context includes an 'APPROVED DESIGN', you MUST follow that technical app
 STRATEGY: READ-THEN-PATCH
 Before you propose a change, look at the 'Current File Content' provided in your context. Your SEARCH blocks MUST match that content exactly, character-for-character, including all whitespace and indentation.
 
-MODES OF OUTPUT:
-1. FULL REWRITE (Preferred for new or small files): Just output the entire file content inside a standard markdown code block. 
-2. SURGICAL PATCHING (Mandatory for large files): Use SEARCH/REPLACE blocks.
+MODES OF OUTPUT (STRICT):
+1. NEW FILES: If the file does not exist yet (like task_6), you MUST output the entire file content inside a single markdown code block (e.g. ```typescript ... ```). DO NOT use SEARCH/REPLACE for new files.
+2. EXISTING FILES: Use SEARCH/REPLACE blocks. You must use the EXACT markers: `<<<< SEARCH`, `=======`, `>>>> REPLACE`. Do not use shorthands like `<SEARCH>`.
 
-CRITICAL: SURGICAL PATCHING RULES
-1. Every change MUST be wrapped in these exact markers:
+FORMAT RULES:
+1. Every change for EXISTING files MUST be wrapped in these exact markers:
 <<<< SEARCH
 [exact current code snippet]
 =======

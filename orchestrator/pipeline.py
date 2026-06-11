@@ -102,16 +102,17 @@ class ReleaseArcOrchestrator:
             
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith("<<<< SEARCH"):
+            # Lenient tag detection (supports <<<< SEARCH, <SEARCH, SEARCH:, etc.)
+            if "SEARCH" in stripped and ("<" in stripped or ":" in stripped):
                 in_search = True
                 search_lines = []
                 continue
-            elif (stripped.startswith("=======") or stripped.startswith("-------")) and in_search:
+            elif in_search and ("====" in stripped or "----" in stripped):
                 in_search = False
                 in_replace = True
                 replace_lines = []
                 continue
-            elif stripped.startswith(">>>> REPLACE") and in_replace:
+            elif in_replace and "REPLACE" in stripped and (">" in stripped or ":" in stripped):
                 in_replace = False
                 s_text = "\n".join(search_lines).strip()
                 r_text = "\n".join(replace_lines).strip()
