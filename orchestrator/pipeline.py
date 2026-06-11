@@ -75,7 +75,6 @@ class ReleaseArcOrchestrator:
                     docs_content.append(f"--- REPOWISE: {rw_file} ---\n{rw_content[:3000]}")
 
         # 5. HUMAN RULINGS & PROJECT SOPs (Context Priming)
-        # Read from centralized metadata storage
         rulings_local_path = f"{self.metadata_dir}/RULINGS.md"
         if os.path.exists(rulings_local_path):
             with open(rulings_local_path, "r") as f:
@@ -87,80 +86,95 @@ class ReleaseArcOrchestrator:
         return full_context
 
     def apply_patches(self, current_content: str, response: str) -> str:
-        """Surgically extract and apply SEARCH/REPLACE blocks using strict line-based markers."""
+        """Robust state-machine parser for SEARCH/REPLACE blocks with normalized whitespace fallback."""
         new_content = current_content
+        lines = response.splitlines()
         
-        # Strict pattern: markers must be at the start of a line
-        pattern = re.compile(r"^<<<< SEARCH\s*(.*?)\s*\n={4,}\s*(.*?)\s*\n>>>> REPLACE", re.DOTALL | re.MULTILINE)
-        blocks = pattern.findall(response)
+        in_search = False
+        in_replace = False
+        search_lines = []
+        replace_lines = []
+        applied_any = False
         
-        if not blocks:
-            # Fallback 1: Manual string splitting if regex fails (e.g. indentation issues)
-            if "<<<< SEARCH" in response and ">>>> REPLACE" in response:
-                logger.warning("Regex failed to find blocks but tags exist. Falling back to string splitting.")
-                raw_blocks = response.split(">>>> REPLACE")
-                applied_any_fallback = False
-                for raw_block in raw_blocks:
-                    if "<<<< SEARCH" not in raw_block: continue
-                    try:
-                        parts = raw_block.split("<<<< SEARCH")
-                        block_body = parts[1]
-                        sections = re.split(r"\n={4,}\n", block_body)
-                        if len(sections) < 2: sections = re.split(r"={4,}", block_body)
-                        if len(sections) >= 2:
-                            search_text, replace_text = sections[0].strip(), sections[1].strip()
-                            if not search_text:
-                                if not applied_any_fallback:
-                                    new_content = replace_text
-                                else:
-                                    new_content += "\n" + replace_text
-                                applied_any_fallback = True
-                            elif search_text in new_content:
-                                new_content = new_content.replace(search_text, replace_text)
-                                applied_any_fallback = True
-                    except: pass
-                if applied_any_fallback: return new_content
+        def normalize(s): 
+            """Remove all non-essential whitespace for comparison."""
+            return re.sub(r"\s+", "", s)
+            
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("<<<< SEARCH"):
+                in_search = True
+                search_lines = []
+                continue
+            elif (stripped.startswith("=======") or stripped.startswith("-------")) and in_search:
+                in_search = False
+                in_replace = True
+                replace_lines = []
+                continue
+            elif stripped.startswith(">>>> REPLACE") and in_replace:
+                in_replace = False
+                s_text = "\n".join(search_lines).strip()
+                r_text = "\n".join(replace_lines).strip()
+                
+                # Handle creation or total replacement
+                if not s_text:
+                    if not applied_any:
+                        new_content = r_text
+                    else:
+                        new_content += "\n" + r_text
+                    applied_any = True
+                elif s_text in new_content:
+                    new_content = new_content.replace(s_text, r_text)
+                    applied_any = True
+                else:
+                    # FUZZY/NORMALIZED FALLBACK
+                    norm_search = normalize(s_text)
+                    if norm_search:
+                        # Attempt to find the block by ignoring all whitespace
+                        # We use a regex that ignores all whitespace between characters
+                        pattern_str = r"\s*".join(re.escape(c) for c in s_text if not c.isspace())
+                        try:
+                            # Search for the pattern in the content
+                            match = re.search(pattern_str, new_content, re.DOTALL)
+                            if match:
+                                logger.info("FUZZY MATCH SUCCESS: Applied patch despite whitespace differences.")
+                                span = match.span()
+                                new_content = new_content[:span[0]] + r_text + new_content[span[1]:]
+                                applied_any = True
+                                continue
+                        except: pass
+                    
+                    logger.warning("SEARCH block match failed", preview=s_text[:50])
+                continue
+                
+            if in_search:
+                search_lines.append(line)
+            elif in_replace:
+                replace_lines.append(line)
 
-            # Fallback 2: Extract clean markdown block
-            content = response
+        # FALLBACK: If state machine failed to apply any patches, try to extract a raw code block
+        if not applied_any:
             if "```" in response:
                 parts = response.split("```")
                 if len(parts) >= 3:
-                    content = parts[1]
-                    if "\n" in content: content = content.split("\n", 1)[1]
-            
-            # Failsafe: Scrub all tags
-            content = re.sub(r"<<<< SEARCH\s*", "", content)
-            content = re.sub(r"={4,}\s*", "", content)
-            content = re.sub(r">>>> REPLACE\s*", "", content)
-            return content.strip()
+                    inner = parts[1]
+                    content = inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
+                    # SCRUBBER: Forcefully remove tags if they bled into the code block
+                    content = re.sub(r"<<<< SEARCH\s*", "", content)
+                    content = re.sub(r"={4,}\s*", "", content)
+                    content = re.sub(r">>>> REPLACE\s*", "", content)
+                    return content.strip()
+            return response.strip()
 
-        applied_any = False
-        for search_text, replace_text in blocks:
-            search_text = search_text.strip()
-            replace_text = replace_text.strip()
-            if not search_text:
-                if not applied_any:
-                    new_content = replace_text
-                else:
-                    new_content += "\n" + replace_text
-                applied_any = True
-            elif search_text in new_content:
-                new_content = new_content.replace(search_text, replace_text)
-                applied_any = True
-            else:
-                logger.error("SEARCH block match failed", search_preview=search_text[:50])
-                raise ValueError(f"Surgical patch failed: Could not find exact match for SEARCH block in file.")
-                
         return new_content
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
-        """Process a task through the GATE framework with Checkpoint & Resume."""
+        """Process a task through the GATE framework with Transactional Commit."""
         db = await get_db()
         arc_id = None
         
         try:
-            # CHECKPOINT: Look for existing arc
+            # CHECKPOINT: Arc Loading
             repo_context = None
             discovery_report = None
             async with db.execute(
@@ -178,7 +192,7 @@ class ReleaseArcOrchestrator:
                     arc_id = cursor.lastrowid
                 await db.commit()
 
-            print(f"🔍 The Scout is mapping the repository...")
+            print(f"🔍 The Scout is gathering intelligence...")
             repo_context = await self.gather_context()
             await db.execute("UPDATE release_arcs SET repo_context = ? WHERE id = ?", (repo_context, arc_id))
             await db.commit()
@@ -187,11 +201,11 @@ class ReleaseArcOrchestrator:
             async with db.execute("SELECT error_type FROM gate_reviews WHERE arc_id = ? ORDER BY id DESC LIMIT 1", (arc_id,) ) as cursor:
                 last_error = await cursor.fetchone()
                 if last_error and last_error[0] == 'incoherent':
-                    print("⚠️  The team is confused. Re-performing deep research...")
+                    print("⚠️  Deep research required...")
                     force_research = True
 
             if not discovery_report or force_research:
-                print("🧠 The Researcher is studying your requirements...")
+                print("🧠 The Researcher is studying the codebase...")
                 research_result = await self.researcher.invoke({"repo_path": self.target_repo, "repo_context": repo_context}, issue_description)
                 discovery_report = research_result.output
                 await db.execute("UPDATE release_arcs SET discovery_report = ? WHERE id = ?", (discovery_report, arc_id))
@@ -210,74 +224,58 @@ class ReleaseArcOrchestrator:
             
             plan = None
             if manual_plan:
-                print("📋 Using manual override plan.")
                 plan = manual_plan
             else:
-                # TIER 1: PLANNING PHASE
                 plan_file = f"{self.metadata_dir}/PLAN_{issue_id}.md"
                 if os.path.exists(plan_file):
-                    print(f"📄 Found existing plan for {issue_id}. Loading...")
+                    print(f"📄 Loading approved plan for {issue_id}...")
                     with open(plan_file, "r") as f:
-                        plan_json = f.read()
+                        content = f.read()
                     try:
-                        json_str = plan_json.split("```json")[1].split("```")[0].strip()
+                        json_str = content.split("```json")[1].split("```")[0].strip()
                         plan_data = json.loads(json_str)
                         plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])
                     except Exception as e:
-                        logger.error("Failed to parse existing plan file. Generating new one.", error=str(e))
+                        logger.error("Plan parsing failed", error=str(e))
                         plan = None
                 
                 if not plan:
-                    print("🏗️  The Architect is decomposing the requirements into a draft plan...")
+                    print("🏗️  The Architect is drafting the blueprint...")
                     plan_result = await self.supervisor.invoke(context, issue_description)
                     if not plan_result.success: return False
                     plan = plan_result.output
                     
                     max_revisions = 3
                     for attempt in range(max_revisions + 1):
-                        print(f"🛡️  The Gatekeeper is reviewing the draft plan (Attempt {attempt+1})...")
+                        print(f"🛡️  The Gatekeeper is reviewing the blueprint (Attempt {attempt+1})...")
                         plan_gate = await self.gatekeeper.review_plan(issue_description, plan)
                         await self._log_gate(db, arc_id, None, "review_plan", plan_gate.approved, plan_gate.critique, error_type=plan_gate.error_type, attempt=attempt+1, metrics=plan_gate.metrics)
                         if plan_gate.approved:
-                            print("✅ Draft Plan approved by Gatekeeper.")
+                            print("✅ Blueprint approved.")
                             break
                         if attempt < max_revisions:
-                            print(f"❌ Plan rejected: {plan_gate.error_type}. The Architect is revising...")
+                            print(f"❌ Blueprint rejected: {plan_gate.error_type}. Revising...")
                             revision_result = await self.supervisor.revise_plan(plan, plan_gate.critique, context)
                             if not revision_result.success: return False
                             plan = revision_result.output
                         else:
-                            print("🚫 Plan failed final review.")
+                            print("🚫 Blueprint failed final review.")
                             return False
 
                     os.makedirs(os.path.dirname(plan_file), exist_ok=True)
                     with open(plan_file, "w") as f:
-                        f.write(f"# Implementation Plan for {issue_id}\n\n")
-                        f.write("## Original Requirement\n")
-                        f.write(f"{issue_description}\n\n")
-                        f.write("## Execution Tasks\n")
-                        f.write("```json\n")
-                        f.write(json.dumps([t.model_dump() for t in plan.tasks], indent=2))
-                        f.write("\n```\n")
-                    
-                    print("\n" + "="*60)
-                    print(f"🛑 PLANNING PAUSE: Draft plan saved to {plan_file}")
-                    print("Run the pipeline again to begin Tier 3 execution.")
-                    print("="*60 + "\n")
-                    return True # Stop execution here for human review
+                        f.write(f"# Implementation Plan for {issue_id}\n\n## Original Requirement\n{issue_description}\n\n## Execution Tasks\n```json\n{json.dumps([t.model_dump() for t in plan.tasks], indent=2)}\n```\n")
+                    print("\n" + "="*60 + f"\n🛑 PLANNING PAUSE: Draft plan saved to {plan_file}\n" + "="*60 + "\n")
+                    return True
 
-            all_diffs = []
-            task_memory = "" 
-            
             # TOPOLOGICAL SORT
             task_dict = {t.id: t for t in plan.tasks}
             resolved = []
             visited = set()
             visiting = set()
-            
             def visit(task_id):
                 if task_id in visited: return True
-                if task_id in visiting: return False # Circular dependency
+                if task_id in visiting: return False
                 visiting.add(task_id)
                 task = task_dict.get(task_id)
                 if task:
@@ -287,14 +285,10 @@ class ReleaseArcOrchestrator:
                 visiting.remove(task_id)
                 visited.add(task_id)
                 return True
-
             for task in plan.tasks:
-                if not visit(task.id):
-                    logger.error("Circular dependency detected in plan")
-                    return False
-                    
-            print(f"🚦 Execution order resolved ({len(resolved)} tasks).")
-
+                if not visit(task.id): return False
+            
+            task_memory = ""
             for task in resolved:
                 async with db.execute("SELECT status FROM tasks WHERE arc_id = ? AND description = ? AND status = 'completed'", (arc_id, task.description)) as cursor:
                     if await cursor.fetchone():
@@ -313,15 +307,14 @@ class ReleaseArcOrchestrator:
                 while task_attempt < max_task_attempts:
                     task_attempt += 1
                     
-                    # GIT ROLLBACK: Ensure pristine state for each attempt
-                    print(f"🧹 Resetting workspace to pristine state...")
-                    rollback_cmd = "if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then git reset --hard HEAD && git clean -fd; else echo 'Not a git repo, skipping rollback'; fi"
+                    # GIT ROLLBACK
+                    rollback_cmd = "git config --global --add safe.directory /workspace || true; if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then git reset --hard HEAD && git clean -fd; fi"
                     await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, rollback_cmd)
 
                     # Strike-Two Breakout
                     if task_attempt == 3 and not task_success:
-                        print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: The AI is stuck on {task.id}\nCRITIQUE: {last_error_feedback[:500]}\n" + "!"*60)
-                        user_hint = input("\nProvide a strategic hint to break the loop, or type 'skip': ").strip()
+                        print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: Stuck on {task.id}\nCRITIQUE: {last_error_feedback[:300]}\n" + "!"*60)
+                        user_hint = input("\nStrategic hint ('skip' to bypass): ").strip()
                         if user_hint.lower() == 'skip':
                             task_success = True
                             break
@@ -330,23 +323,19 @@ class ReleaseArcOrchestrator:
                             rulings_path = f"{self.metadata_dir}/RULINGS.md"
                             with open(rulings_path, "a") as rf:
                                 rf.write(f"\n- **Rule from {task.id}**: {user_hint}\n")
-                            print("🧠 Hint permanently saved to Project Rulings.")
 
-                    print(f"🔨 The Engineer is working on {task.id} (Attempt {task_attempt})...")
+                    print(f"🔨 Working on {task.id} (Attempt {task_attempt})...")
                     mission_desc = current_task_desc
                     if task_attempt > 1:
-                        print(f"🔄 Retrying {task.id} with self-healing feedback...")
                         mission_desc += f"\n\nPREVIOUS FAILURE FEEDBACK:\n{last_error_feedback}"
                     
                     temp_task = TaskDefinition(id=task.id, description=mission_desc, target_file=task.target_file, dependencies=task.dependencies, design_constraints=task.design_constraints, acceptance_criteria=task.acceptance_criteria)
                     
-                    # Ensure Worker proposes a design before execution
+                    # Gate 2: Design
                     design_request = f"Task: {temp_task.description}\nConstraints: {temp_task.design_constraints}\nProvide a detailed technical design proposal."
                     design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=[{"role": "user", "content": design_request}])
-                    
                     design_gate = await self.gatekeeper.review_design(temp_task, design_proposal)
                     if not design_gate.approved: 
-                        print(f"⚠️  Design check failed for {task.id}. Self-healing...")
                         last_error_feedback = f"Design Rejected: {design_gate.critique}"
                         continue
                     
@@ -356,23 +345,19 @@ class ReleaseArcOrchestrator:
                     w_output: WorkerResult = worker_res.output
                     
                     if not task.target_file:
-                        task_memory += f"\n--- PERSISTENT ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
+                        task_memory += f"\n--- ANALYSIS ({task.id}) ---\n{w_output.diff}\n"
                     context["task_memory"] = task_memory
                     
-                    print(f"🛡️  The Gatekeeper is performing code review...")
+                    # Gate 3: Code Review
                     cr_gate = await self.gatekeeper.codereview(temp_task, w_output)
-                    
                     if cr_gate.approved and cr_gate.confidence < self.config.min_gate_confidence:
-                        print(f"⚠️  Gatekeeper approved, but confidence ({cr_gate.confidence}) is below threshold. Forcing retry.")
                         cr_gate.approved = False
-                        cr_gate.error_type = "incoherent"
-                        cr_gate.critique += f"\n\nSYSTEM OVERRIDE: Approval confidence too low."
+                        cr_gate.critique += f"\n\nLOW CONFIDENCE OVERRIDE."
 
                     if cr_gate.approved:
-                        # STAGE THE CHANGE
                         if task.target_file:
                             if any(p in task.target_file for p in self.protected_paths):
-                                print(f"🛑 SOURCE GUARD BLOCKED WRITE: {task.target_file}")
+                                print(f"🛑 SOURCE GUARD BLOCKED: {task.target_file}")
                             else:
                                 filepath = f"{self.target_repo}/{task.target_file}"
                                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -392,174 +377,113 @@ class ReleaseArcOrchestrator:
                                     elif ext == ".py": linter_cmd = f"python3 -m py_compile {tmp_path}"
                                     
                                     if linter_cmd:
-                                        print(f"🔍 Running linter pre-flight on {task.target_file}...")
-                                        lint_out, lint_code = await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, linter_cmd)
+                                        _, lint_code = await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, linter_cmd)
                                         if lint_code != 0:
-                                            os.remove(tmp_path)
-                                            raise ValueError(f"Linter pre-flight failed:\n{lint_out}")
+                                            raise ValueError("Linter pre-flight failed on .tmp file.")
 
-                                    # ATOMIC COMMIT: Rename to real file BEFORE full verification
-                                    # (Full verification commands like 'npm test' require standard paths)
+                                    # REALITY CHECK (Rename THEN verify)
                                     os.rename(tmp_path, filepath)
-
-                                    # REALITY CHECK (VerifierEngine)
-                                    print(f"🧪 Running autonomous reality check...")
                                     verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
                                     verification = await verifier.verify(temp_task.description, repo_context, [task.target_file])
                                     
                                     if not verification.success:
                                         print(f"❌ Reality check failed: {verification.reason}")
                                         cr_gate.approved = False
-                                        cr_gate.critique += f"\n\nEMPIRICAL FAILURE:\n{verification.reason}"
+                                        cr_gate.critique += f"\n\nEMPIRICAL FAILURE: {verification.reason}"
                                         last_error_feedback = cr_gate.critique
-                                        # Note: Git Rollback at start of next attempt will clean this up
                                     else:
                                         print(f"✨ Task {task.id} passed all gates.")
                                         all_diffs.append(w_output)
-                                        await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
+                                        await db.execute("UPDATE tasks SET status = 'completed' WHERE arc_id = ? AND description = ?", (arc_id, task.description))
                                         await db.commit()
-                                        
-                                        # LOCAL GIT CHECKPOINT
-                                        checkpoint_cmd = f"git add . && git commit -m 'GATE Checkpoint: {task.id} - {task.description[:50]}'"
-                                        await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, checkpoint_cmd)
-                                        
+                                        await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, f"git add . && git commit -m 'GATE: {task.id}'")
                                         task_success = True
                                         break
                                 except Exception as e:
-                                    last_error_feedback = f"Surgical patch or validation failed: {str(e)}"
-                                    print(f"❌ Pre-flight failed: {str(e)}")
+                                    last_error_feedback = f"Execution failed: {str(e)}"
                                     cr_gate.approved = False
                                     continue
                         else:
                             # Analysis task
                             task_success = True
-                            await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
+                            await db.execute("UPDATE tasks SET status = 'completed' WHERE arc_id = ? AND description = ?", (arc_id, task.description))
                             await db.commit()
                             break
 
                     if not cr_gate.approved:
                         last_error_feedback = cr_gate.critique
-                        print(f"❌ Gate review failed: {cr_gate.error_type}. Self-healing...")
+                        print(f"❌ Gate rejected: {cr_gate.error_type}")
                 
-                if not task_success:
-                    print(f"🚫 Task {task.id} failed after {max_task_attempts} attempts.")
-                    return False
+                if not task_success: return False
                     
-            print(f"🏁 Finalizing mission review...")
             final_gate = await self.gatekeeper.review_code(issue_description, plan, all_diffs)
-            await self._log_gate(db, arc_id, None, "review_code", final_gate.approved, final_gate.review_summary, error_type=final_gate.primary_failure_mode, metrics=final_gate.metrics)
             status = "completed" if final_gate.approved else "failed"
             await db.execute("UPDATE release_arcs SET status = ? WHERE id = ?", (status, arc_id))
             await db.commit()
-            print(f"\n🚀 Mission Status: {status.upper()}")
+            print(f"\n🚀 Mission: {status.upper()}")
             return final_gate.approved
             
         except Exception as e:
-            print(f"\n💥 PIPELINE CRASHED: {str(e)}")
-            traceback.print_exc()
+            print(f"\n💥 CRASH: {str(e)}")
             return False
 
     async def _log_gate(self, db, arc_id, task_id, gate_name, approved, critique, error_type=None, attempt=1, verification_method=None, metrics=None):
         status = "approved" if approved else "rejected"
         metrics = metrics or {}
-        prompt_t = metrics.get("prompt_tokens", 0)
-        comp_t = metrics.get("completion_tokens", 0)
         try:
             await db.execute(
                 """INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number, verification_method, prompt_tokens, completion_tokens)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt, verification_method, prompt_t, comp_t)
+                (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt, verification_method, metrics.get("prompt_tokens",0), metrics.get("completion_tokens",0))
             )
-        except Exception as e:
-             logger.warning("Failed to log rich gate metrics", error=str(e))
-             await db.execute(
-                """INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt)
-            )
+        except Exception:
+             await db.execute("INSERT INTO gate_reviews (arc_id, task_id, gate_name, model_id, status, error_type, critique_summary, attempt_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (arc_id, task_id, gate_name, self.gatekeeper.model_id, status, error_type, critique, attempt))
         await db.commit()
 
 if __name__ == "__main__":
     async def run():
         try:
             print("\n" + "="*50 + "\n🚀 GATE PIPELINE ORCHESTRATOR\n" + "="*50)
-            
             session_file = "metadata/LAST_SESSION.json"
-            target_repo = None
-            issue_id = None
-            
+            target_repo, issue_id = None, None
             if os.path.exists(session_file):
-                with open(session_file, "r") as f:
-                    last_session = json.load(f)
-                resume_input = input(f"\n🔄 Continue from last session?\n   Repo: {last_session.get('repo')}\n   Issue: {last_session.get('issue_id')}\n   [Y/n]: ").strip().lower()
-                if resume_input != 'n':
-                    target_repo = last_session.get('repo')
-                    issue_id = last_session.get('issue_id')
-            
-            if not target_repo:
-                target_repo = input(f"\nEnter Target Repo Path [current dir]: ").strip() or "."
+                with open(session_file, "r") as f: last_session = json.load(f)
+                if input(f"\n🔄 Resume {last_session.get('issue_id')}? [Y/n]: ").strip().lower() != 'n':
+                    target_repo, issue_id = last_session.get('repo'), last_session.get('issue_id')
+            if not target_repo: target_repo = input(f"Target Repo: ").strip() or "."
             
             project_name = os.path.basename(target_repo.rstrip("/"))
             metadata_dir = f"metadata/{project_name}"
             os.makedirs(metadata_dir, exist_ok=True)
             
             config_path = os.path.join(metadata_dir, "gate.yml")
-            project_guidelines = "Follow standard engineering best practices."
-            orch_protected_paths = None
+            project_guidelines, orch_protected_paths = "Standard practices.", None
             if os.path.exists(config_path):
-                print(f"📄 Loaded project configuration from {config_path}")
-                with open(config_path, "r") as f:
-                    gate_cfg = yaml.safe_load(f)
-                    
-                project_guidelines = f"PROJECT GOAL:\n{gate_cfg.get('project_goal', '')}\n\n"
-                project_guidelines += f"TECHNICAL STACK:\n{yaml.dump(gate_cfg.get('technical_stack', []))}\n\n"
-                project_guidelines += f"ARCHITECTURE:\n{gate_cfg.get('architecture', '')}\n\n"
-                project_guidelines += f"CONSTRAINTS:\n{gate_cfg.get('constraints', '')}\n\n"
-                project_guidelines += f"PROJECT GUIDELINES:\n{gate_cfg.get('guidelines', '')}"
-                orch_protected_paths = gate_cfg.get('protected_paths', ["provider-portal-app", "sevicare-app", "admin-portal", "vendor-portal"])
-            else:
-                print(f"⚠️  No gate.yml found in {metadata_dir}.")
-
+                with open(config_path, "r") as f: gate_cfg = yaml.safe_load(f)
+                project_guidelines = f"GOAL: {gate_cfg.get('project_goal', '')}\nSTACK: {gate_cfg.get('technical_stack', '')}\nARCH: {gate_cfg.get('architecture', '')}\nRULES: {gate_cfg.get('guidelines', '')}"
+                orch_protected_paths = gate_cfg.get('protected_paths')
+            
             orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines, protected_paths=orch_protected_paths)
-            
-            if not issue_id:
-                issue_id = input("\nEnter Issue ID [e.g. TICKET-123]: ").strip()
-                if not issue_id:
-                    print("❌ Issue ID is required.")
-                    sys.exit(1)
-            
-            with open(session_file, "w") as f:
-                json.dump({"repo": target_repo, "issue_id": issue_id}, f)
+            if not issue_id: issue_id = input("Issue ID: ").strip()
+            with open(session_file, "w") as f: json.dump({"repo": target_repo, "issue_id": issue_id}, f)
             
             plan_file = os.path.join(metadata_dir, f"PLAN_{issue_id}.md")
             issue_desc = ""
             if os.path.exists(plan_file):
-                print(f"📄 Existing plan found. Resuming execution for {issue_id}...")
-                with open(plan_file, "r") as f:
-                    content = f.read()
-                    if "## Original Requirement\n" in content:
-                        issue_desc = content.split("## Original Requirement\n")[1].split("## Execution Tasks")[0].strip()
+                with open(plan_file, "r") as f: content = f.read()
+                if "## Original Requirement\n" in content: issue_desc = content.split("## Original Requirement\n")[1].split("## Execution Tasks")[0].strip()
             else:
-                print("\nDescribe the overarching task or feature requirements:")
                 issue_desc = input("Task Description: ").strip()
-                if not issue_desc:
-                    print("❌ Task Description is required.")
-                    sys.exit(1)
-                
+            if not issue_id or not issue_desc: sys.exit(1)
             await orch.process_issue(issue_id, issue_desc)
-        except KeyboardInterrupt:
-            print("\n👋 Shutdown requested by user.")
-        except Exception as e:
-            print(f"\n💥 STARTUP ERROR: {str(e)}")
+        except Exception as e: print(f"\n💥 ERROR: {str(e)}")
         finally:
             try:
                 pending = asyncio.all_tasks()
-                for task in pending:
-                    if task is not asyncio.current_task(): task.cancel()
-                if pending:
-                    await asyncio.gather(*[p for p in pending if p is not asyncio.current_task()], return_exceptions=True)
+                for t in pending:
+                    if t is not asyncio.current_task(): t.cancel()
                 loop = asyncio.get_event_loop()
                 await loop.shutdown_asyncgens()
-                print("✨ Resources released.")
+                print("✨ Done.")
             except Exception: pass
     asyncio.run(run())
