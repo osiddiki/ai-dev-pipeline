@@ -5,6 +5,7 @@ import sys
 import os
 import re
 import traceback
+import yaml
 from typing import Any, Optional, List
 from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
 from agents.worker import WorkerAgent, WorkerResult
@@ -17,40 +18,6 @@ from ledger.database import get_db
 from environment.sandbox import DockerSandbox
 
 logger = structlog.get_logger()
-
-# PROJECT DIRECTIVE: Sevi Test Data Generator
-DATA_GEN_DIRECTIVE = """
-PROJECT GOAL:
-Develop a standalone TypeScript CLI utility called test-data-generator to generate medically realistic patient datasets.
-
-TECHNICAL STACK:
-- Language: TypeScript (Node.js)
-- Source of Truth: provider-portal-app/e2e/patient-data.ts
-- Dependencies: faker, date-fns
-
-ARCHITECTURE (Unified Model Pattern):
-1. Generator (UPM): Creates a 'Unified Patient Model' in memory.
-2. Clinical Profiles: Use profiles (e.g., 'Type 2 Diabetic') for medical coherence (ICD-10, Medications).
-3. Exporters: Translate UPM to JSON, FHIR, and HL7.
-
-CONSTRAINTS:
-- Medical Integrity: Logically consistent dates (DOB before onset) and gender-matched diagnoses.
-- EHR Flavors: Support --flavor flag (epic, cerner).
-- ID Consistency: Matching IDs across JSON, HL7, and FHIR outputs in a batch.
-"""
-
-SEVI_GUIDELINES = f"""
-{DATA_GEN_DIRECTIVE}
-
-GENERAL SEVI STANDARDS:
-1. ARCHITECTURE: Respect the Monorepo structure and Federation patterns.
-2. INFRASTRUCTURE: When starting a NEW standalone utility, ensure the plan includes necessary project initialization (package.json, tsconfig.json) to make the code executable, but keep implementation tasks strictly scoped to the user's request.
-3. STANDARDS: Follow the established coding standards for the 21 microservices.
-4. DOCUMENTATION: Ensure all new components or changes are documented in ONBOARDING.md.
-5. TESTING: Always consider how changes will be tested across the federated system.
-6. SECURITY: Maintain strict HIPAA compliance protocols.
-7. SERIALIZATION: Tasks MUST be strictly sequential.
-"""
 
 class ReleaseArcOrchestrator:
     """Manages the full GATE pipeline execution (The Release Arc)."""
@@ -80,10 +47,16 @@ class ReleaseArcOrchestrator:
         """Gather structural, textual, and symbolic context from the repository."""
         sandbox = DockerSandbox(self.target_repo)
         structure_out, _ = await asyncio.to_thread(sandbox.execute_command, "find . -maxdepth 2 -not -path '*/.*' 2>/dev/null || ls -F")
-        with open("agents/repo_map.py", "r") as f:
-            script_content = f.read()
-        sandbox.write_file("repo_map_tool.py", script_content)
-        repo_map_out, _ = await asyncio.to_thread(sandbox.execute_command, "python3 repo_map_tool.py .")
+        
+        # Load offline RAG index
+        index_path = f"{self.metadata_dir}/repo_index.txt"
+        repo_map_out = ""
+        if os.path.exists(index_path):
+            with open(index_path, "r") as f:
+                repo_map_out = f.read()
+        else:
+            print("⚠️  No offline RAG index found. Run 'python scripts/build_repo_index.py <repo_path>' to improve context retrieval.")
+
         doc_files = ["AGENTS.md", "sevicare-app/AGENTS.md", "README.md", "CONTRIBUTING.md", "sevicare-app/README.md"]
         docs_content = []
         for doc in doc_files:
@@ -474,15 +447,29 @@ class ReleaseArcOrchestrator:
 if __name__ == "__main__":
     async def run():
         try:
-            print("\n" + "="*50 + "\n🚀 GATE PIPELINE: SEVI TEST DATA GENERATOR\n" + "="*50)
-            default_repo = "/Users/omarsiddiki/sevisolutions"
-            repo_input = input(f"\nEnter Target Repo Path [{default_repo}]: ").strip()
-            target_repo = repo_input if repo_input else default_repo
-            orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=SEVI_GUIDELINES)
+            print("\n" + "="*50 + "\n🚀 GATE PIPELINE ORCHESTRATOR\n" + "="*50)
+            target_repo = input(f"\nEnter Target Repo Path [current dir]: ").strip() or "."
+            
+            # Decoupled Configuration Loading
+            config_path = os.path.join(target_repo, ".gate.yml")
+            project_guidelines = "Follow standard engineering best practices."
+            if os.path.exists(config_path):
+                print(f"📄 Loaded project configuration from {config_path}")
+                with open(config_path, "r") as f:
+                    gate_cfg = yaml.safe_load(f)
+                    
+                project_guidelines = f"PROJECT GOAL:\n{gate_cfg.get('project_goal', '')}\n\n"
+                project_guidelines += f"TECHNICAL STACK:\n{yaml.dump(gate_cfg.get('technical_stack', []))}\n\n"
+                project_guidelines += f"ARCHITECTURE:\n{gate_cfg.get('architecture', '')}\n\n"
+                project_guidelines += f"CONSTRAINTS:\n{gate_cfg.get('constraints', '')}\n\n"
+                project_guidelines += f"PROJECT GUIDELINES:\n{gate_cfg.get('guidelines', '')}"
+            else:
+                print("⚠️  No .gate.yml found in target repository. Operating with generic default guidelines.")
+
+            orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines)
             issue_id = input("\nEnter Issue ID [GEN-001]: ").strip() or "GEN-001"
-            print("\nDescribe the task (Press Enter for Phase 1 default):")
+            
             default_task = "Analyze provider-portal-app/e2e/patient-data.ts and create a standalone types.ts file in a new directory test-data-generator/src/ that includes all necessary interfaces for a Unified Patient Model. Ensure the directory is initialized with a basic package.json."
-            print(f"[Default]: {default_task}")
             issue_desc = input("\nTask Description: ").strip() or default_task
             await orch.process_issue(issue_id, issue_desc)
         except KeyboardInterrupt:
