@@ -288,8 +288,11 @@ class ReleaseArcOrchestrator:
             for task in plan.tasks:
                 if not visit(task.id): return False
             
-            task_memory = ""
-            for task in resolved:
+            print(f"🚦 Execution queue: {[t.id for t in resolved]}")
+
+            for i, task in enumerate(resolved):
+                print(f"\n" + "-"*40 + f"\n⚡ TASK {i+1}/{len(resolved)}: {task.id}\n" + "-"*40)
+                
                 async with db.execute("SELECT status FROM tasks WHERE arc_id = ? AND description = ? AND status = 'completed'", (arc_id, task.description)) as cursor:
                     if await cursor.fetchone():
                         print(f"⏭️  Skipping completed task: {task.id}")
@@ -306,6 +309,7 @@ class ReleaseArcOrchestrator:
 
                 while task_attempt < max_task_attempts:
                     task_attempt += 1
+                    # ... rest of task logic ...
                     
                     # GIT ROLLBACK
                     rollback_cmd = "git config --global --add safe.directory /workspace || true; if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then git reset --hard HEAD && git clean -fd; fi"
