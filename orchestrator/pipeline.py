@@ -10,6 +10,7 @@ from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
 from agents.worker import WorkerAgent, WorkerResult
 from agents.gatekeeper import GatekeeperAgent
 from agents.researcher import ResearcherAgent
+from agents.meta_analyzer import MetaAnalyzerAgent
 from agents.models import GateConfig
 from orchestrator.verifier import VerifierEngine
 from ledger.database import get_db
@@ -73,6 +74,7 @@ class ReleaseArcOrchestrator:
         self.worker = WorkerAgent(model_id=self.config.executor_model)
         self.gatekeeper = GatekeeperAgent(model_id=self.config.verifier_model)
         self.researcher = ResearcherAgent(model_id=self.config.planner_model)
+        self.meta_analyzer = MetaAnalyzerAgent(model_id=self.config.planner_model)
         
     async def gather_context(self) -> str:
         """Gather structural, textual, and symbolic context from the repository."""
@@ -176,6 +178,14 @@ class ReleaseArcOrchestrator:
                 await db.commit()
             else:
                 print("📂 Using cached project intelligence.")
+                
+            # META-ANALYSIS LOOP
+            print("🔬 The Meta-Analyzer is reviewing historical data...")
+            meta_result = await self.meta_analyzer.invoke({}, db)
+            if meta_result.success and meta_result.output:
+                print(f"⚠️  META-WARNING INJECTED: {meta_result.output}")
+                # We inject this directly into the guidelines so all agents see it
+                self.guidelines += f"\n\nCRITICAL META-WARNING FROM PAST FAILURES:\n{meta_result.output}\n"
             
             context = {"guidelines": self.guidelines, "repo_path": self.target_repo, "repo_context": repo_context, "discovery_report": discovery_report}
             

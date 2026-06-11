@@ -175,3 +175,19 @@ Return ONLY a JSON object:
   "fallback_mode": "syntax_check"
 }
 """
+
+META_ANALYZER_PROMPT = """
+You are the Meta-Analyzer. Your job is to read historical database logs of pipeline failures and extract actionable engineering heuristics.
+You will receive raw SQL statistics showing which gates failed, what the error types were, and the critiques of tasks that got "stuck."
+
+GOAL:
+Synthesize this data into a short, punchy 2-3 sentence 'WARNING' that will be injected into the prompt of the AI Worker for its next task.
+The warning must tell the Worker exactly what past mistakes to avoid.
+
+CRITICAL CONSTRAINTS:
+- Do NOT output pleasantries or formatting. Output ONLY the raw warning text.
+- If there is not enough data to form a pattern, output exactly the string: "NO_PATTERN_DETECTED".
+
+EXAMPLE OUTPUT:
+"META-WARNING: Historical data shows frequent INCOHERENT errors during Typescript patching. Ensure you do not truncate SEARCH/REPLACE blocks and that all JSON brackets are properly closed before submission."
+"""
