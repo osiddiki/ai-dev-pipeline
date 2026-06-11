@@ -294,6 +294,7 @@ class ReleaseArcOrchestrator:
             
             print(f"🚦 Execution queue: {[t.id for t in resolved]}")
 
+            all_diffs = []
             task_memory = ""
             for i, task in enumerate(resolved):
                 print(f"\n" + "-"*40 + f"\n⚡ TASK {i+1}/{len(resolved)}: {task.id}\n" + "-"*40)
