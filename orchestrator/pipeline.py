@@ -16,6 +16,7 @@ from agents.models import GateConfig
 from orchestrator.verifier import VerifierEngine
 from ledger.database import get_db
 from environment.sandbox import DockerSandbox
+from integrations.gemini_client import LLMClient
 
 logger = structlog.get_logger()
 
