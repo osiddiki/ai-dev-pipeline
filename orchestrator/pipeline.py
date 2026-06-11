@@ -313,7 +313,7 @@ class ReleaseArcOrchestrator:
 
                     # Strike-Two Breakout
                     if task_attempt == 3 and not task_success:
-                        print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: Stuck on {task.id}\nCRITIQUE: {last_error_feedback[:300]}\n" + "!"*60)
+                        print("\n" + "!"*60 + f"\n🚨 STRIKE TWO: Stuck on {task.id}\nCRITIQUE: {last_error_feedback[:1000]}\n" + "!"*60)
                         user_hint = input("\nStrategic hint ('skip' to bypass): ").strip()
                         if user_hint.lower() == 'skip':
                             task_success = True
@@ -367,22 +367,26 @@ class ReleaseArcOrchestrator:
                                 
                                 try:
                                     updated_content = self.apply_patches(existing_content, w_output.diff)
-                                    tmp_path = os.path.join(os.path.dirname(filepath), f".tmp.{os.path.basename(filepath)}")
-                                    with open(tmp_path, "w") as f: f.write(updated_content)
+                                    tmp_path_host = os.path.join(os.path.dirname(filepath), f".tmp.{os.path.basename(filepath)}")
+                                    with open(tmp_path_host, "w") as f: f.write(updated_content)
                                     
                                     # LINTER PRE-FLIGHT
                                     ext = os.path.splitext(task.target_file)[1]
+                                    # Sandbox-relative path for the command
+                                    tmp_rel_path = os.path.join(os.path.dirname(task.target_file), f".tmp.{os.path.basename(filepath)}")
                                     linter_cmd = None
-                                    if ext == ".ts": linter_cmd = f"npx tsc --noEmit {tmp_path}"
-                                    elif ext == ".py": linter_cmd = f"python3 -m py_compile {tmp_path}"
+                                    if ext == ".ts": linter_cmd = f"npx tsc --noEmit {tmp_rel_path}"
+                                    elif ext == ".py": linter_cmd = f"python3 -m py_compile {tmp_rel_path}"
                                     
                                     if linter_cmd:
-                                        _, lint_code = await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, linter_cmd)
+                                        print(f"🔍 Running linter pre-flight on {task.target_file}...")
+                                        lint_out, lint_code = await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, linter_cmd)
                                         if lint_code != 0:
-                                            raise ValueError("Linter pre-flight failed on .tmp file.")
+                                            if os.path.exists(tmp_path_host): os.remove(tmp_path_host)
+                                            raise ValueError(f"Linter failed on .tmp file:\n{lint_out}")
 
                                     # REALITY CHECK (Rename THEN verify)
-                                    os.rename(tmp_path, filepath)
+                                    os.rename(tmp_path_host, filepath)
                                     verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
                                     verification = await verifier.verify(temp_task.description, repo_context, [task.target_file])
                                     
