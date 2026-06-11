@@ -37,10 +37,14 @@ class DockerSandbox:
         logger.info("Executing command in sandbox", command=command, repo=str(self.target_repo_path))
         
         try:
+            # SAFETY: Configure git to trust the workspace to avoid 'dubious ownership' errors
+            # We chain this with the actual command
+            safe_git_cmd = f"git config --global --add safe.directory {self.container_workspace} && {command}"
+            
             # We mount the host project directory into the container's /workspace
             container = self.client.containers.run(
                 image=self.image,
-                command=f"bash -c '{command}'",
+                command=f"bash -c \"{safe_git_cmd}\"",
                 volumes={
                     str(self.target_repo_path): {
                         'bind': self.container_workspace,
