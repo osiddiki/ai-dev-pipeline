@@ -398,21 +398,22 @@ class ReleaseArcOrchestrator:
                                             os.remove(tmp_path)
                                             raise ValueError(f"Linter pre-flight failed:\n{lint_out}")
 
+                                    # ATOMIC COMMIT: Rename to real file BEFORE full verification
+                                    # (Full verification commands like 'npm test' require standard paths)
+                                    os.rename(tmp_path, filepath)
+
                                     # REALITY CHECK (VerifierEngine)
                                     print(f"🧪 Running autonomous reality check...")
                                     verifier = VerifierEngine(sandbox=DockerSandbox(self.target_repo))
-                                    # Temporarily point verifier at the .tmp file if possible
                                     verification = await verifier.verify(temp_task.description, repo_context, [task.target_file])
                                     
                                     if not verification.success:
-                                        os.remove(tmp_path)
                                         print(f"❌ Reality check failed: {verification.reason}")
                                         cr_gate.approved = False
                                         cr_gate.critique += f"\n\nEMPIRICAL FAILURE:\n{verification.reason}"
                                         last_error_feedback = cr_gate.critique
+                                        # Note: Git Rollback at start of next attempt will clean this up
                                     else:
-                                        # SUCCESS: Atomic Commit
-                                        os.rename(tmp_path, filepath)
                                         print(f"✨ Task {task.id} passed all gates.")
                                         all_diffs.append(w_output)
                                         await db.execute("UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND description = ?", (arc_id, task.description))
