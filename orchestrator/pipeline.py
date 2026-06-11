@@ -87,15 +87,23 @@ class ReleaseArcOrchestrator:
     def apply_patches(self, current_content: str, response: str) -> str:
         """Parse and apply SEARCH/REPLACE blocks with flexible separator support."""
         # Use a more forgiving regex that handles optional newlines around empty search blocks
-        pattern = re.compile(r"<<<< SEARCH\s*(.*?)\s*={4,10}\s*(.*?)\s*>>>> REPLACE", re.DOTALL)
+        pattern = re.compile(r"<<<< SEARCH\s*(.*?)\s*={4,}\s*(.*?)\s*>>>> REPLACE", re.DOTALL)
         blocks = pattern.findall(response)
+        
+        def clean_fallback(text: str) -> str:
+            text = re.sub(r"<<<< SEARCH\s*", "", text)
+            text = re.sub(r"={4,}\s*", "", text)
+            text = re.sub(r">>>> REPLACE\s*", "", text)
+            return text.strip()
+            
         if not blocks:
             if "```" in response:
                 parts = response.split("```")
                 if len(parts) >= 3:
                     inner = parts[1]
-                    return inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
-            return response
+                    inner = inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
+                    return clean_fallback(inner)
+            return clean_fallback(response)
             
         new_content = current_content
         for search, replace in blocks:
