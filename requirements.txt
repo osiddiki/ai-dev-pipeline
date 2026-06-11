@@ -8,3 +8,5 @@ docker>=6.1.0
 litellm>=1.0.0
 python-dotenv>=1.0.0
 httpx>=0.24.0
+aiosqlite
+PyYAML
