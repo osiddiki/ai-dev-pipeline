@@ -127,7 +127,7 @@ class ReleaseArcOrchestrator:
                     await db.execute("UPDATE release_arcs SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (arc_id,))
                 else:
                     print(f"🎯 Starting new mission: {issue_id}")
-                    cursor = await db.execute("INSERT INTO release_arcs (issue_id, repository, status) VALUES (?, ?, 'planning')", (issue_id, self.target_repo, 'planning'))
+                    cursor = await db.execute("INSERT INTO release_arcs (issue_id, repository, status) VALUES (?, ?, 'planning')", (issue_id, self.target_repo))
                     arc_id = cursor.lastrowid
                 await db.commit()
 
