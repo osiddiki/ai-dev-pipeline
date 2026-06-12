@@ -84,8 +84,8 @@ class DockerSandbox:
         logger.info("Writing file in sandbox", path=file_path)
         import base64
         encoded = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-        # We use a temp file and move it to avoid partial writes if base64 fails
-        output, exit_code = self.execute_command(f"echo '{encoded}' | base64 -d > {file_path}")
+        # Ensure parent directory exists inside the container before writing
+        output, exit_code = self.execute_command(f"mkdir -p $(dirname {file_path}) && echo '{encoded}' | base64 -d > {file_path}")
         return exit_code == 0
 
     def read_file(self, file_path: str) -> str:
