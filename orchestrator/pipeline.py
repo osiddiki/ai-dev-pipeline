@@ -185,25 +185,35 @@ class ReleaseArcOrchestrator:
                             await db.execute("UPDATE tasks SET status = 'pending', commit_sha = NULL WHERE arc_id = ? AND id >= (SELECT id FROM tasks WHERE arc_id = ? AND task_id = ?)", (arc_id, arc_id, task.id))
                             await db.commit()
 
-                attempts, success, feedback = 3, False, ""
+                attempts, success, feedback = 4, False, ""
                 while attempts > 0:
                     attempts -= 1
+                    if success: break
+                    
                     sandbox = DockerSandbox(self.target_repo)
                     out, code = await asyncio.to_thread(sandbox.execute_command, "git reset --hard HEAD && git clean -fdx")
                     if code != 0: GateUI.warning(f"Cleanup failed: {out}")
                     
                     if attempts == 0 and not success:
-                        GateUI.error("STRIKE TWO")
-                        hint = input(f"{C_YELLOW}Strategic hint: {C_END}").strip()
+                        GateUI.error("MISSION STALLED")
+                        hint = input(f"{C_YELLOW}Final Strategic Hint ('skip' to bypass): {C_END}").strip()
                         if hint.lower() == 'skip': success = True; break
                         elif hint: task.description += f"\n\nHINT: {hint}"
+                        attempts = 1 # One last try with user hint
 
-                    GateUI.step("🔨", f"Working... ({attempts+1} attempts left)")
+                    GateUI.step("🔨", f"Attempting Task... ({attempts+1} tries remaining)")
                     
+                    # AUTO-ESCALATION LOGIC
+                    temp_boost = 0.0
+                    escalation_prefix = ""
+                    if attempts <= 1: # Last two attempts
+                        temp_boost = 0.4
+                        escalation_prefix = "CRITICAL CORRECTION REQUIRED: You have failed previous attempts. You MUST address the feedback below perfectly while maintaining all original constraints."
+
                     # DESIGN
-                    design_req = f"Task: {task.id}\n{task.description}\nConstraints: {task.design_constraints}\n{feedback}\nProvide TypeScript design."
+                    design_req = f"{escalation_prefix}\nTask: {task.id}\n{task.description}\nConstraints: {task.design_constraints}\n{feedback}\nProvide TypeScript design."
                     design_messages = [{"role": "system", "content": DESIGNER_PROMPT}, {"role": "user", "content": design_req}]
-                    design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=design_messages)
+                    design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=design_messages, temperature=0.3 + temp_boost)
                     
                     d_gate = await self.gatekeeper.review_design(task, design_proposal)
                     GateUI.gate_result("DESIGN", d_gate.approved, d_gate.critique)
