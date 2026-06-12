@@ -37,11 +37,13 @@ class DockerSandbox:
         logger.info("Executing command in sandbox", command=command, repo=str(self.target_repo_path))
         
         try:
-            # SAFETY: Configure git to trust the workspace. We use a more robust shell string.
-            # We check if git exists before trying to configure it to avoid exit code 127/2 noise.
+            # SAFETY: Configure git to trust everything in the container.
+            # We use '*' to avoid ownership issues between Mac host and Docker root.
             safe_git_cmd = (
                 f"if command -v git >/dev/null 2>&1; then "
-                f"git config --global --add safe.directory {self.container_workspace}; "
+                f"git config --global --add safe.directory '*'; "
+                f"git config --global user.email 'gate@sevisolutions.com'; "
+                f"git config --global user.name 'Gatekeeper'; "
                 f"fi; {command}"
             )
             
@@ -55,13 +57,14 @@ class DockerSandbox:
                     }
                 },
                 working_dir=self.container_workspace,
-                detach=True, # Detach to wait for result
+                detach=True,
                 mem_limit="512m",
                 network_disabled=False
             )
             result = container.wait()
             exit_code = result.get("StatusCode", 0)
-            output = container.logs().decode("utf-8")
+            # Capture BOTH stdout and stderr
+            output = container.logs(stdout=True, stderr=True).decode("utf-8")
             container.remove()
             
             if exit_code != 0:

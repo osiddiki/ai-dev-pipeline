@@ -63,7 +63,8 @@ MODES OF OUTPUT (STRICT):
 2. EXISTING FILES: Use SEARCH/REPLACE blocks. You must use the EXACT markers: `<<<< SEARCH`, `=======`, `>>>> REPLACE`. Do not use shorthands like `<SEARCH>`.
 
 FORMAT RULES:
-1. Every change for EXISTING files MUST be wrapped in these exact markers:
+1. PURE CODE BLOCKS: Markdown code blocks (```typescript ...) MUST contain ONLY the source code of the file. DO NOT include conversational text, "I'm done" messages, or explanations inside the code block.
+2. Every change for EXISTING files MUST be wrapped in these exact markers:
 <<<< SEARCH
 [exact current code snippet]
 =======

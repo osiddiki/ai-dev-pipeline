@@ -37,7 +37,9 @@ class GateUI:
     @staticmethod
     def warning(text: str): print(f"{C_YELLOW}⚠️  {text}{C_END}")
     @staticmethod
-    def error(text: str): print(f"{C_RED}❌ {text}{C_END}")
+    def error(text: str, details: str = ""):
+        print(f"{C_RED}❌ {text}{C_END}")
+        if details: print(f"      {C_YELLOW}{details[:1000]}{C_END}")
     @staticmethod
     def gate_result(gate_name: str, approved: bool, critique: str = ""):
         status = f"{C_GREEN}APPROVED{C_END}" if approved else f"{C_RED}REJECTED{C_END}"
@@ -106,6 +108,9 @@ class ReleaseArcOrchestrator:
 
     async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
         db = await get_db()
+        try: await db.execute("ALTER TABLE tasks ADD COLUMN commit_sha TEXT"); await db.commit()
+        except: pass
+        
         arc_id, all_diffs, task_memory = None, [], ""
         try:
             GateUI.header(f"🚀 MISSION: {issue_id}")
@@ -117,7 +122,13 @@ class ReleaseArcOrchestrator:
                     arc_id = cursor.lastrowid
                 await db.commit()
 
-            git_init_cmd = "git init && git config --global --add safe.directory /workspace && git config --global user.email 'gate@sevisolutions.com' && git config --global user.name 'Gatekeeper' && git commit --allow-empty -m 'GATE Init' || true"
+            # IDENTITY: Persist locally in the repo
+            git_init_cmd = (
+                "git init && "
+                "git config user.email 'gate@sevisolutions.com' && "
+                "git config user.name 'Gatekeeper' && "
+                "git commit --allow-empty -m 'GATE Init' || true"
+            )
             await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, git_init_cmd)
 
             repo_context = await self.gather_context()
@@ -144,14 +155,42 @@ class ReleaseArcOrchestrator:
 
             for i, task in enumerate(plan.tasks):
                 GateUI.header(f"⚡ TASK {i+1}/{len(plan.tasks)}: {task.id}")
-                async with db.execute("SELECT status FROM tasks WHERE arc_id = ? AND task_id = ? AND status = 'completed'", (arc_id, task.id)) as cursor:
-                    if await cursor.fetchone(): GateUI.success("Skipping completed task."); continue
+                
+                # --- STATE RECONCILIATION ENGINE (GATE 8.0) ---
+                async with db.execute("SELECT status, commit_sha FROM tasks WHERE arc_id = ? AND task_id = ?", (arc_id, task.id)) as cursor:
+                    row = await cursor.fetchone()
+                    if row and row[0] == 'completed':
+                        expected_sha = row[1]
+                        sandbox = DockerSandbox(self.target_repo)
+                        actual_sha_out, _ = await asyncio.to_thread(sandbox.execute_command, "git rev-parse HEAD")
+                        actual_sha = actual_sha_out.strip()
+                        
+                        exists_out, _ = await asyncio.to_thread(sandbox.execute_command, f"[ -f {task.target_file} ] && echo 'yes' || echo 'no'")
+                        file_exists = exists_out.strip() == 'yes' if task.target_file else True
+
+                        if actual_sha == expected_sha and file_exists:
+                            GateUI.success(f"Synced with disk state ({actual_sha[:7]}). Skipping.")
+                            continue
+                        else:
+                            GateUI.warning(f"Desync detected. Disk: {actual_sha[:7]}, DB: {expected_sha[:7] if expected_sha else 'NONE'}")
+                            if expected_sha:
+                                GateUI.step("🔧", f"Restoring state {expected_sha[:7]}...")
+                                # Forcefully clean everything before checkout to avoid local change blocks (like .DS_Store)
+                                await asyncio.to_thread(sandbox.execute_command, "git reset --hard HEAD && git clean -fdx")
+                                out, code = await asyncio.to_thread(sandbox.execute_command, f"git checkout {expected_sha}")
+                                if code == 0: GateUI.success("Restoration successful."); continue
+                                else: GateUI.warning(f"Restoration failed: {out}")
+                            
+                            GateUI.error("Reconciliation failed. Resetting downstream.")
+                            await db.execute("UPDATE tasks SET status = 'pending', commit_sha = NULL WHERE arc_id = ? AND id >= (SELECT id FROM tasks WHERE arc_id = ? AND task_id = ?)", (arc_id, arc_id, task.id))
+                            await db.commit()
 
                 attempts, success, feedback = 3, False, ""
                 while attempts > 0:
                     attempts -= 1
                     sandbox = DockerSandbox(self.target_repo)
-                    await asyncio.to_thread(sandbox.execute_command, "git reset --hard HEAD && git clean -fdx")
+                    out, code = await asyncio.to_thread(sandbox.execute_command, "git reset --hard HEAD && git clean -fdx")
+                    if code != 0: GateUI.warning(f"Cleanup failed: {out}")
                     
                     if attempts == 0 and not success:
                         GateUI.error("STRIKE TWO")
@@ -161,7 +200,7 @@ class ReleaseArcOrchestrator:
 
                     GateUI.step("🔨", f"Working... ({attempts+1} attempts left)")
                     
-                    # Gate 2: DESIGN (Anchored Identity)
+                    # DESIGN
                     design_req = f"Task: {task.id}\n{task.description}\nConstraints: {task.design_constraints}\n{feedback}\nProvide TypeScript design."
                     design_messages = [{"role": "system", "content": DESIGNER_PROMPT}, {"role": "user", "content": design_req}]
                     design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=design_messages)
@@ -174,41 +213,36 @@ class ReleaseArcOrchestrator:
                     worker_res = await self.worker.invoke({"guidelines": self.guidelines, "repo_path": self.target_repo, "repo_context": repo_context, "discovery_report": discovery_report, "approved_design": design_proposal, "task_memory": task_memory}, task)
                     w_out = worker_res.output
                     
-                    # Gate 3: CODE REVIEW
+                    # CODE REVIEW
                     cr_gate = await self.gatekeeper.codereview(task, w_out)
                     GateUI.gate_result("CODE", cr_gate.approved, cr_gate.critique)
                     
                     if cr_gate.approved:
-                        if not task.target_file: success = True; break
+                        if not task.target_file:
+                            GateUI.success("Analysis finished.")
+                            await db.execute("INSERT INTO tasks (arc_id, task_id, status) VALUES (?, ?, 'completed')", (arc_id, task.id))
+                            await db.commit(); success = True; break
                         
                         filepath = f"{self.target_repo}/{task.target_file}"
                         os.makedirs(os.path.dirname(filepath), exist_ok=True)
                         existing = ""
                         if os.path.exists(filepath):
                             with open(filepath, "r") as f: existing = f.read()
-                        
                         try:
                             updated = self.apply_patches(existing, w_out.diff)
-                            
-                            # HARDENING: Use .tmp.ts extension so tsc recognizes it
-                            # Also place it in the same directory as the target
-                            tmp_filename = f".tmp.{os.path.basename(task.target_file)}"
-                            tmp_rel = os.path.join(os.path.dirname(task.target_file), tmp_filename)
+                            # HARDENING: Prefix with .tmp. to preserve extension (e.g. .tmp.types.ts)
+                            tmp_dir = os.path.dirname(task.target_file)
+                            tmp_base = f".tmp.{os.path.basename(task.target_file)}"
+                            tmp_rel = os.path.join(tmp_dir, tmp_base)
                             sandbox.write_file(tmp_rel, updated)
-                            
-                            # Linter Pre-flight
+
                             if task.target_file.endswith(".ts"):
-                                GateUI.step("🔍", f"Linter checking {tmp_filename}...")
-                                # We point tsc to the local tsconfig if it exists
-                                project_dir = task.target_file.split('/')[0]
-                                lint_cmd = f"npx tsc --noEmit --skipLibCheck {tmp_rel}"
+                                GateUI.step("🔍", "Linter checking...")
+                                lint_cmd = f"npx tsc --noEmit {tmp_rel} --skipLibCheck --target esnext --module commonjs"
                                 _, code = await asyncio.to_thread(sandbox.execute_command, lint_cmd)
-                                if code != 0: 
-                                    # Fallback: simple syntax check if tsc is amnesiac about types
-                                    GateUI.warning("Full linter failed, falling back to syntax check.")
-                                    syntax_cmd = f"node --check {tmp_rel}" if not task.target_file.endswith(".ts") else f"npx tsc {tmp_rel} --noEmit --target esnext --module commonjs --skipLibCheck"
-                                    _, s_code = await asyncio.to_thread(sandbox.execute_command, syntax_cmd)
-                                    if s_code != 0: raise ValueError("Code has syntax errors.")
+                                if code != 0: raise ValueError("Linter detected errors.")
+
+                                if l_code != 0: GateUI.warning(f"Linter found issues: {l_out}"); raise ValueError("Linter failed.")
 
                             # FINAL COMMIT
                             sandbox.write_file(task.target_file, updated)
@@ -217,17 +251,24 @@ class ReleaseArcOrchestrator:
                             ver = await VerifierEngine(sandbox=sandbox).verify(task.description, repo_context, [task.target_file])
                             if not ver.success: feedback = f"Reality Check: {ver.reason}"; continue
                             
-                            GateUI.success("Finalized.")
-                            await db.execute("INSERT INTO tasks (arc_id, task_id, status) VALUES (?, ?, 'completed')", (arc_id, task.id))
+                            # --- CAPTURE STATE ---
+                            GateUI.step("💾", "Capturing state...")
+                            checkpoint_cmd = f"git add . && (git commit -m 'GATE: {task.id}' || echo 'No changes') && git rev-parse HEAD"
+                            sha_out, sha_code = await asyncio.to_thread(sandbox.execute_command, checkpoint_cmd)
+                            if sha_code != 0: GateUI.error("Checkpoint failed.", sha_out); raise ValueError("Git checkpoint failed.")
+                            final_sha = sha_out.strip().split('\n')[-1]
+                            
+                            await db.execute("UPDATE tasks SET status = 'completed', commit_sha = ?, updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (final_sha, arc_id, task.id))
                             await db.commit()
-                            await asyncio.to_thread(sandbox.execute_command, f"git add . && git commit -m 'GATE: {task.id}'")
-                            success = True; break
+                            
+                            GateUI.success(f"Finalized at state {final_sha[:7]}.")
+                            all_diffs.append(w_out); success = True; break
                         except Exception as e: feedback = str(e); continue
                     else: feedback = cr_gate.critique
                 if not success: return False
             GateUI.header("🏁 MISSION COMPLETE")
             return True
-        except Exception as e: GateUI.error(f"CRASH: {str(e)}"); traceback.print_exc(); return False
+        except Exception as e: GateUI.error(f"FATAL: {str(e)}"); traceback.print_exc(); return False
 
 if __name__ == "__main__":
     async def run():

@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT, -- e.g. 'task_1'
     description TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', -- pending, in_progress, code_review, completed, failed
+    commit_sha TEXT, -- The Git HEAD SHA after this task was finalized
     dependencies TEXT, -- JSON list of task IDs
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
