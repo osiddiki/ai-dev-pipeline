@@ -25,13 +25,13 @@ class GatekeeperAgent(BaseAgent):
         """Base invoke not used directly by gatekeeper."""
         raise NotImplementedError("Use specific gate methods (review_plan, review_design, etc.)")
     
-    async def review_plan(self, issue: str, plan: SupervisorPlan) -> GateResult:
+    async def review_plan(self, issue: str, plan: SupervisorPlan, active_rules: str = "") -> GateResult:
         """Gate 1: Shift-left validation of decomposed tasks."""
         logger.info("Gatekeeper running 'review_plan' gate", tasks_count=len(plan.tasks))
         
         messages = [
             {"role": "system", "content": GATEKEEPER_PLAN_PROMPT},
-            {"role": "user", "content": f"Requirement: {issue}\nProposed Plan: {plan.json()}\nDoes this plan have any omissions or logical flaws?"}
+            {"role": "user", "content": f"Requirement: {issue}\nActive learned rules:\n{active_rules or 'None'}\nProposed Plan: {plan.json()}\nDoes this plan have any omissions or logical flaws?"}
         ]
         
         raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, response_format=GateReviewReport)
@@ -71,26 +71,26 @@ class GatekeeperAgent(BaseAgent):
         raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, response_format=GateReviewReport)
         return self._parse_response(raw_response, metrics)
 
-    async def codereview(self, task: TaskDefinition, worker_result: WorkerResult) -> GateResult:
+    async def codereview(self, task: TaskDefinition, worker_result: WorkerResult, active_rules: str = "") -> GateResult:
         """Gate 3: Narrow context file-scoped review."""
         logger.info("Gatekeeper running 'codereview' gate", task=task.id)
         
         messages = [
             {"role": "system", "content": GATEKEEPER_CODE_PROMPT},
-            {"role": "user", "content": f"Task: {task.description}\nImplementation Diff:\n{worker_result.diff}\nValidation Output: {worker_result.linter_output}"}
+            {"role": "user", "content": f"Task: {task.description}\nActive learned rules:\n{active_rules or 'None'}\nImplementation Diff:\n{worker_result.diff}\nValidation Output: {worker_result.linter_output}"}
         ]
         
         raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, response_format=GateReviewReport)
         return self._parse_response(raw_response, metrics)
 
-    async def review_code(self, issue: str, plan: SupervisorPlan, diffs: List[WorkerResult]) -> GateResult:
+    async def review_code(self, issue: str, plan: SupervisorPlan, diffs: List[WorkerResult], active_rules: str = "") -> GateResult:
         """Gate 4: Broad context task validation."""
         logger.info("Gatekeeper running 'review_code' gate against original issue.")
         
         all_diffs_text = "\n".join([f"Task {d.task_id} Diff:\n{d.diff}" for d in diffs])
         messages = [
             {"role": "system", "content": GATEKEEPER_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Original Requirement: {issue}\nComplete Implementation:\n{all_diffs_text}"}
+            {"role": "user", "content": f"Original Requirement: {issue}\nActive learned rules:\n{active_rules or 'None'}\nComplete Implementation:\n{all_diffs_text}"}
         ]
         
         raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, response_format=GateReviewReport)

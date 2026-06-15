@@ -2,6 +2,7 @@ import docker
 import structlog
 from pathlib import Path
 import os
+import shlex
 import sys
 
 logger = structlog.get_logger()
@@ -87,27 +88,30 @@ class DockerSandbox:
         logger.info("Writing file in sandbox", path=file_path)
         import base64
         encoded = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+        quoted_path = shlex.quote(file_path)
         # Ensure parent directory exists inside the container before writing
-        output, exit_code = self.execute_command(f"mkdir -p $(dirname {file_path}) && echo '{encoded}' | base64 -d > {file_path}")
+        output, exit_code = self.execute_command(f"mkdir -p $(dirname {quoted_path}) && echo '{encoded}' | base64 -d > {quoted_path}")
         return exit_code == 0
 
     def read_file(self, file_path: str) -> str:
         """Read a file from the sandbox safely."""
         logger.info("Reading file in sandbox", path=file_path)
+        quoted_path = shlex.quote(file_path)
         # Check if exists first to avoid error log noise
-        exists_out, exists_code = self.execute_command(f"[ -f {file_path} ] && echo 'yes' || echo 'no'")
+        exists_out, exists_code = self.execute_command(f"[ -f {quoted_path} ] && echo 'yes' || echo 'no'")
         if exists_out.strip() != "yes":
             return "[File does not exist]"
-        output, exit_code = self.execute_command(f"cat {file_path}")
+        output, exit_code = self.execute_command(f"cat {quoted_path}")
         return output
 
     def read_file_window(self, file_path: str, start_line: int, end_line: int) -> str:
         """ACI Paginator: Read a specific window of lines from a file."""
         logger.info("Reading file window", path=file_path, start=start_line, end=end_line)
-        exists_out, _ = self.execute_command(f"[ -f {file_path} ] && echo 'yes' || echo 'no'")
+        quoted_path = shlex.quote(file_path)
+        exists_out, _ = self.execute_command(f"[ -f {quoted_path} ] && echo 'yes' || echo 'no'")
         if exists_out.strip() != "yes":
             return "[File does not exist]"
-        output, _ = self.execute_command(f"sed -n '{start_line},{end_line}p' {file_path}")
+        output, _ = self.execute_command(f"sed -n '{start_line},{end_line}p' {quoted_path}")
         return output
 
     def check_latex(self, file_path: str) -> str:

@@ -1,44 +1,108 @@
 # GATE Pipeline Operational Guide
 
-This guide explains how to use and optimize your autonomous AI Development Pipeline.
+## Running A Release Arc
 
-## 1. How to Use
-To trigger a new "Release Arc" (a unit of work), follow these steps:
+Start the orchestrator:
 
-1. **Configure the Task:** Open `orchestrator/pipeline.py`.
-2. **Set the Target:** Change `target_repo` to the directory name of the project you want to modify (e.g., `sevicare-app`).
-3. **Describe the Issue:** Update the `process_issue` call with a clear ID and a detailed description of what you want.
-4. **Run it:**
-   ```bash
-   cd ai-dev-pipeline
-   PYTHONPATH=. .venv/bin/python orchestrator/pipeline.py
-   ```
-
-## 2. Optimization Strategies
-
-### Quality vs. Cost
-- **Current Setup:** Flash (Worker) + Pro (Gatekeeper). This is the best balance for most tasks.
-- **For High-Value Code:** If you are modifying billing or clinical logic, change the Gatekeeper in `integrations/gemini_client.py` to `gemini/gemini-2.0-pro-thinking-exp` (if available) or `openai/o1-preview`.
-- **For Repetitive Tasks:** For simple refactors, you can use Flash for both roles, but you MUST increase the Gatekeeper's `temperature` to 0.7 to encourage it to find errors.
-
-### Handling "High Demand" (503 Errors)
-If Gemini Pro is busy:
-1. Wait 60 seconds and retry.
-2. The pipeline is stateful—it saves your progress in `trust_ledger.db`. You can modify the code to "resume" an arc rather than starting over.
-
-## 3. Monitoring "System Trust"
-The `trust_ledger.db` is your primary tool for monitoring. Run these queries to check your team's performance:
-
-**Check why the Gatekeeper is rejecting work:**
 ```bash
-sqlite3 trust_ledger.db "SELECT critique_summary FROM gate_reviews WHERE status = 'rejected' ORDER BY id DESC LIMIT 5;"
+PYTHONPATH=. .venv/bin/python orchestrator/pipeline.py
 ```
 
-**Check which model is the most "expensive":**
-```bash
-sqlite3 trust_ledger.db "SELECT model_id, SUM(prompt_tokens + completion_tokens) as total_tokens FROM metrics GROUP BY model_id;"
+Provide the target repository, issue id, and task description when prompted. The orchestrator creates or resumes a release arc in `trust_ledger.db`.
+
+By default, GATE creates an isolated git worktree under:
+
+```text
+$GATE_WORKTREE_ROOT/gate-worktrees/
 ```
 
-## 4. Sandbox Maintenance
-- The sandbox runs in **Linux**. If your target project requires specific tools (like `go` or `pnpm`), update the `image` parameter in `environment/sandbox.py` to a more robust image (e.g., `sevicare-dev-env`).
-- Always ensure Docker Desktop is running before starting the pipeline.
+If `GATE_WORKTREE_ROOT` is not set, the system uses the OS temp directory.
+
+## How A Task Completes
+
+For each task:
+
+1. Supervisor provides an explicit file allowlist.
+2. Codex runs through `codex exec --sandbox workspace-write`.
+3. GATE checks the git diff.
+4. GATE rejects unexpected files and temp artifacts.
+5. GATE installs dependencies in Docker when enabled and needed.
+6. GATE runs deterministic validation.
+7. Failed attempts are classified as plan, prompt, model, scope, dependency, syntax/type, or environment failures.
+8. GATE either rewrites the Codex repair brief, repairs the pending plan/allowlist, escalates model routing, or trips a circuit breaker.
+9. Gatekeeper reviews the verified diff.
+10. GATE stages exact files and commits the task checkpoint.
+
+## Inspecting State
+
+Recent release arcs:
+
+```bash
+sqlite3 trust_ledger.db "SELECT id, issue_id, status, updated_at FROM release_arcs ORDER BY id DESC LIMIT 10;"
+```
+
+Task status:
+
+```bash
+sqlite3 trust_ledger.db "SELECT task_id, status, substr(commit_sha,1,8), updated_at FROM tasks ORDER BY id DESC LIMIT 20;"
+```
+
+Verification evidence:
+
+```bash
+sqlite3 trust_ledger.db "SELECT task_id, status, reason FROM verification_runs ORDER BY id DESC LIMIT 10;"
+```
+
+Gatekeeper rejections:
+
+```bash
+sqlite3 trust_ledger.db "SELECT task_id, gate_name, error_type, critique_summary FROM gate_reviews WHERE status = 'rejected' ORDER BY id DESC LIMIT 10;"
+```
+
+Failure classifications:
+
+```bash
+sqlite3 trust_ledger.db "SELECT task_id, failure_class, recommended_action, confidence FROM failure_analyses ORDER BY id DESC LIMIT 20;"
+```
+
+Prompt and model route history:
+
+```bash
+sqlite3 trust_ledger.db "SELECT task_id, attempt_number, substr(prompt_hash,1,12), model_route FROM prompt_rewrites ORDER BY id DESC LIMIT 20;"
+```
+
+Rule proposals:
+
+```bash
+sqlite3 trust_ledger.db "SELECT id, scope, confidence, status, rule_text FROM rule_proposals ORDER BY id DESC LIMIT 20;"
+```
+
+Approve a proposed rule:
+
+```bash
+sqlite3 trust_ledger.db "UPDATE rule_proposals SET status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = 1;"
+```
+
+Replay self-improvement analysis without invoking Codex or LLMs:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/replay_self_improvement.py 1 --project test-data-generator
+```
+
+## Recovery
+
+Failed attempts are reset inside the isolated worktree, not the source checkout. Successful task checkpoints remain as commits on the arc branch.
+
+If a worktree becomes invalid, remove it manually after confirming you do not need its uncommitted contents, then rerun the pipeline. GATE will recreate it from the source repository.
+
+## Tuning
+
+Primary settings are in `GateConfig`:
+
+- `max_task_attempts`: increase for difficult tasks.
+- `allow_dependency_install`: disable if the sandbox must never touch registries.
+- `use_git_worktree`: keep enabled for safety.
+- `codex_command`: set if Codex is installed under a different command name.
+- `model_policy`: use `policy_ladder` for adaptive cost/quality routing.
+- `rule_mode`: keep `review_first` when mined rules should require approval.
+- `max_prompt_rewrites` and `max_plan_repairs`: bound self-improvement loops.

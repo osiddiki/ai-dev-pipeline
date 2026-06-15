@@ -1,6 +1,6 @@
 import json
 from typing import Any, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from .base import BaseAgent, AgentResult
 from .prompts import SUPERVISOR_PROMPT
 from integrations.gemini_client import LLMClient
@@ -12,9 +12,18 @@ class TaskDefinition(BaseModel):
     id: str
     description: str
     target_file: Optional[str] = None
-    dependencies: List[str] = []
+    target_files: List[str] = Field(default_factory=list)
+    dependencies: List[str] = Field(default_factory=list)
     design_constraints: str = "Follow project guidelines."
     acceptance_criteria: str = "Code compiles and passes linting."
+
+    @property
+    def allowed_files(self) -> List[str]:
+        if self.target_files:
+            return self.target_files
+        if self.target_file:
+            return [self.target_file]
+        return []
 
 class SupervisorPlan(BaseModel):
     tasks: List[TaskDefinition]

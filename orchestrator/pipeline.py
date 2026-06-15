@@ -1,25 +1,40 @@
 import asyncio
-import structlog
 import json
-import sys
 import os
 import re
+import shlex
+import subprocess
+import tempfile
 import traceback
-import yaml
-from typing import Any, Optional, List
-from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
-from agents.worker import WorkerAgent, WorkerResult
-from agents.gatekeeper import GatekeeperAgent
-from agents.researcher import ResearcherAgent
-from agents.meta_analyzer import MetaAnalyzerAgent
-from agents.models import GateConfig
-from agents.prompts import DESIGNER_PROMPT
-from orchestrator.verifier import VerifierEngine
-from ledger.database import get_db
-from environment.sandbox import DockerSandbox
-from integrations.gemini_client import LLMClient
+from pathlib import Path
+from typing import List, Optional
 
-# --- UI CONSTANTS ---
+import structlog
+import yaml
+
+from agents.codex_worker import CodexWorkerAgent
+from agents.gatekeeper import GateResult, GatekeeperAgent
+from agents.meta_analyzer import MetaAnalyzerAgent
+from agents.models import GateConfig, VerificationResult
+from agents.researcher import ResearcherAgent
+from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
+from agents.worker import WorkerResult
+from environment.sandbox import DockerSandbox
+from ledger.database import get_db
+from orchestrator.self_improvement import (
+    CircuitBreaker,
+    FailureAnalysis,
+    FailureAnalyzer,
+    ModelRouter,
+    PlanRepairAgent,
+    PromptRewriter,
+    Rule,
+    RuleMiner,
+    RuleStore,
+    prompt_hash,
+)
+from orchestrator.verifier import VerifierEngine
+
 C_BLUE = "\033[94m"
 C_GREEN = "\033[92m"
 C_YELLOW = "\033[93m"
@@ -27,288 +42,1238 @@ C_RED = "\033[91m"
 C_BOLD = "\033[1m"
 C_END = "\033[0m"
 
+logger = structlog.get_logger()
+
+
 class GateUI:
     @staticmethod
-    def header(text: str): print(f"\n{C_BOLD}{'='*60}\n{text}\n{'='*60}{C_END}")
+    def header(text: str):
+        print(f"\n{C_BOLD}{'=' * 60}\n{text}\n{'=' * 60}{C_END}")
+
     @staticmethod
-    def step(icon: str, text: str, color: str = C_BLUE): print(f"{color}{icon} {text}{C_END}")
+    def step(label: str, text: str, color: str = C_BLUE):
+        print(f"{color}[{label}] {text}{C_END}")
+
     @staticmethod
-    def success(text: str): print(f"{C_GREEN}✅ {text}{C_END}")
+    def success(text: str):
+        print(f"{C_GREEN}[OK] {text}{C_END}")
+
     @staticmethod
-    def warning(text: str): print(f"{C_YELLOW}⚠️  {text}{C_END}")
+    def warning(text: str):
+        print(f"{C_YELLOW}[WARN] {text}{C_END}")
+
     @staticmethod
     def error(text: str, details: str = ""):
-        print(f"{C_RED}❌ {text}{C_END}")
-        if details: print(f"      {C_YELLOW}{details[:1000]}{C_END}")
+        print(f"{C_RED}[FAIL] {text}{C_END}")
+        if details:
+            print(f"      {C_YELLOW}{details[:1000]}{C_END}")
+
     @staticmethod
     def gate_result(gate_name: str, approved: bool, critique: str = ""):
         status = f"{C_GREEN}APPROVED{C_END}" if approved else f"{C_RED}REJECTED{C_END}"
-        print(f"   🛡️  {C_BOLD}{gate_name.upper()}:{C_END} {status}")
+        print(f"   {C_BOLD}{gate_name.upper()}:{C_END} {status}")
         if not approved and critique:
-            wrapped = "\n      ".join(critique.split("\n")[:3])
-            print(f"      {C_YELLOW}{wrapped}...{C_END}")
+            wrapped = "\n      ".join(critique.split("\n")[:4])
+            print(f"      {C_YELLOW}{wrapped}{C_END}")
 
-logger = structlog.get_logger()
 
 class ReleaseArcOrchestrator:
+    """GATE release controller with Codex as the implementation worker."""
+
     def __init__(self, target_repo: str, guidelines: Optional[str] = None, config: Optional[GateConfig] = None):
-        self.target_repo = target_repo
-        self.project_name = os.path.basename(self.target_repo.rstrip("/"))
-        self.metadata_dir = f"metadata/{self.project_name}"
-        os.makedirs(self.metadata_dir, exist_ok=True)
+        self.source_repo = Path(target_repo).resolve()
+        self.project_name = self.source_repo.name
+        self.metadata_dir = Path("metadata") / self.project_name
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+
         self.guidelines = guidelines or "Follow professional best practices."
         self.config = config or GateConfig()
         self.supervisor = SupervisorAgent(model_id=self.config.planner_model)
-        self.worker = WorkerAgent(model_id=self.config.executor_model)
+        self.worker = CodexWorkerAgent(
+            codex_command=self.config.codex_command,
+            sandbox=self.config.codex_sandbox,
+        )
         self.gatekeeper = GatekeeperAgent(model_id=self.config.verifier_model)
         self.researcher = ResearcherAgent(model_id=self.config.planner_model)
         self.meta_analyzer = MetaAnalyzerAgent(model_id=self.config.planner_model)
-        
-    async def gather_context(self) -> str:
-        sandbox = DockerSandbox(self.target_repo)
-        structure_out, _ = await asyncio.to_thread(sandbox.execute_command, "find . -maxdepth 2 -not -path '*/.*' 2>/dev/null || ls -F")
-        doc_files = ["AGENTS.md", "README.md", "package.json"]
-        docs = []
-        for doc in doc_files:
-            content = sandbox.read_file(doc)
-            if "[File does not exist]" not in content: docs.append(f"--- {doc} ---\n{content[:1000]}")
-        return f"STRUCTURE:\n{structure_out}\n\nDOCS:\n" + "\n".join(docs)
+        self.failure_analyzer = FailureAnalyzer()
+        self.prompt_rewriter = PromptRewriter()
+        self.plan_repairer = PlanRepairAgent()
+        self.model_router = ModelRouter(self.config)
+        self.rule_store = RuleStore(self.metadata_dir)
+        self.rule_miner = RuleMiner()
+        self.circuit_breaker = CircuitBreaker()
 
-    def apply_patches(self, current_content: str, response: str) -> str:
-        if "<<<< SEARCH" not in response and "```" in response:
-            parts = response.split("```")
-            if len(parts) >= 3:
-                inner = parts[1]
-                return inner.split("\n", 1)[1].strip() if "\n" in inner else inner.strip()
-        new_content = current_content
-        lines = response.splitlines()
-        in_search, in_replace = False, False
-        search_lines, replace_lines = [], []
-        applied_any = False
-        for line in lines:
-            stripped = line.strip()
-            if "SEARCH" in stripped and ("<" in stripped or ":" in stripped): in_search, search_lines = True, []
-            elif in_search and ("====" in stripped or "----" in stripped): in_search, in_replace, replace_lines = False, True, []
-            elif in_replace and "REPLACE" in stripped and (">" in stripped or ":" in stripped):
-                in_replace = False
-                s_text, r_text = "\n".join(search_lines).strip(), "\n".join(replace_lines).strip()
-                if not s_text: new_content = (new_content + "\n" + r_text) if applied_any else r_text
-                elif s_text in new_content: new_content = new_content.replace(s_text, r_text)
-                else:
-                    norm_search = re.sub(r"\s+", "", s_text)
-                    if norm_search:
-                        pattern_str = r"\s*".join(re.escape(c) for c in s_text if not c.isspace())
-                        match = re.search(pattern_str, new_content, re.DOTALL)
-                        if match: new_content = new_content[:match.span()[0]] + r_text + new_content[match.span()[1]:]
-                applied_any = True
-                continue
-            if in_search: search_lines.append(line)
-            elif in_replace: replace_lines.append(line)
-        return new_content if applied_any else re.sub(r"<<<< SEARCH\s*|={4,}\s*|>>>> REPLACE\s*", "", response).strip()
-
-    async def process_issue(self, issue_id: str, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
+    async def process_issue(
+        self,
+        issue_id: str,
+        issue_description: str,
+        manual_plan: Optional[SupervisorPlan] = None,
+    ) -> bool:
         db = await get_db()
-        try: await db.execute("ALTER TABLE tasks ADD COLUMN commit_sha TEXT"); await db.commit()
-        except: pass
-        
-        arc_id, all_diffs, task_memory = None, [], ""
+        work_repo: Optional[Path] = None
+        all_diffs: List[WorkerResult] = []
+
         try:
-            GateUI.header(f"🚀 MISSION: {issue_id}")
-            async with db.execute("SELECT id FROM release_arcs WHERE issue_id = ? AND status != 'completed' ORDER BY id DESC LIMIT 1", (issue_id,)) as cursor:
-                row = await cursor.fetchone()
-                if row: arc_id = row[0]; GateUI.step("🔄", "Resuming mission.")
-                else:
-                    cursor = await db.execute("INSERT INTO release_arcs (issue_id, repository, status) VALUES (?, ?, 'planning')", (issue_id, self.target_repo))
-                    arc_id = cursor.lastrowid
-                await db.commit()
+            await self._migrate_ledger(db)
+            arc_id = await self._get_or_create_arc(db, issue_id)
+            active_rules = await self.rule_store.load_active_rules(db, self.project_name)
+            active_rules_text = self.rule_store.render_for_prompt(active_rules)
 
-            # IDENTITY: Persist locally in the repo
-            git_init_cmd = (
-                "git init && "
-                "git config user.email 'gate@sevisolutions.com' && "
-                "git config user.name 'Gatekeeper' && "
-                "git commit --allow-empty -m 'GATE Init' || true"
+            GateUI.header(f"MISSION: {issue_id}")
+            if active_rules:
+                GateUI.step("rules", f"Loaded {len(active_rules)} approved learned rule(s).")
+            self._ensure_git_repo(self.source_repo)
+            work_repo = self._prepare_execution_repo(issue_id, arc_id)
+            await db.execute(
+                "UPDATE release_arcs SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (arc_id,),
             )
-            await asyncio.to_thread(DockerSandbox(self.target_repo).execute_command, git_init_cmd)
+            await db.commit()
 
-            repo_context = await self.gather_context()
-            GateUI.step("🧠", "Studying architecture...")
-            research_result = await self.researcher.invoke({"repo_path": self.target_repo, "repo_context": repo_context}, issue_description)
+            base_sha = self._git(work_repo, ["rev-parse", "HEAD"]).strip()
+            repo_context = await self.gather_context(work_repo)
+
+            GateUI.step("context", "Building technical discovery report.")
+            research_result = await self.researcher.invoke(
+                {"repo_path": str(work_repo), "repo_context": repo_context},
+                issue_description,
+            )
             discovery_report = research_result.output
 
-            plan_file = f"{self.metadata_dir}/PLAN_{issue_id}.md"
-            plan = manual_plan
-            if not plan and os.path.exists(plan_file):
-                with open(plan_file, "r") as f:
-                    try:
-                        json_str = f.read().split("```json")[1].split("```")[0].strip()
-                        plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in json.loads(json_str)])
-                    except: plan = None
-            
+            plan = await self._load_or_create_plan(
+                db=db,
+                arc_id=arc_id,
+                issue_id=issue_id,
+                issue_description=issue_description,
+                repo_context=repo_context,
+                discovery_report=discovery_report,
+                manual_plan=manual_plan,
+                active_rules_text=active_rules_text,
+            )
             if not plan:
-                GateUI.step("🏗️", "Drafting blueprint...")
-                plan_result = await self.supervisor.invoke({"guidelines": self.guidelines, "repo_path": self.target_repo, "repo_context": repo_context, "discovery_report": discovery_report}, issue_description)
-                plan = plan_result.output
-                with open(plan_file, "w") as f: f.write(f"```json\n{json.dumps([t.model_dump() for t in plan.tasks], indent=2)}\n```\n")
-                GateUI.warning(f"PLANNING PAUSE: {plan_file}")
-                return True
+                await self._fail_arc(db, arc_id)
+                return False
 
-            for i, task in enumerate(plan.tasks):
-                GateUI.header(f"⚡ TASK {i+1}/{len(plan.tasks)}: {task.id}")
-                
-                # --- STATE RECONCILIATION ENGINE (GATE 8.0) ---
-                async with db.execute("SELECT status, commit_sha FROM tasks WHERE arc_id = ? AND task_id = ?", (arc_id, task.id)) as cursor:
-                    row = await cursor.fetchone()
-                    if row and row[0] == 'completed':
-                        expected_sha = row[1]
-                        sandbox = DockerSandbox(self.target_repo)
-                        actual_sha_out, _ = await asyncio.to_thread(sandbox.execute_command, "git rev-parse HEAD")
-                        actual_sha = actual_sha_out.strip()
-                        
-                        exists_out, _ = await asyncio.to_thread(sandbox.execute_command, f"[ -f {task.target_file} ] && echo 'yes' || echo 'no'")
-                        file_exists = exists_out.strip() == 'yes' if task.target_file else True
+            await self._persist_tasks(db, arc_id, plan)
 
-                        if actual_sha == expected_sha and file_exists:
-                            GateUI.success(f"Synced with disk state ({actual_sha[:7]}). Skipping.")
-                            continue
-                        else:
-                            GateUI.warning(f"Desync detected. Disk: {actual_sha[:7]}, DB: {expected_sha[:7] if expected_sha else 'NONE'}")
-                            if expected_sha:
-                                GateUI.step("🔧", f"Restoring state {expected_sha[:7]}...")
-                                # Forcefully clean everything before checkout to avoid local change blocks (like .DS_Store)
-                                await asyncio.to_thread(sandbox.execute_command, "git reset --hard HEAD && git clean -fdx")
-                                out, code = await asyncio.to_thread(sandbox.execute_command, f"git checkout {expected_sha}")
-                                if code == 0: GateUI.success("Restoration successful."); continue
-                                else: GateUI.warning(f"Restoration failed: {out}")
-                            
-                            GateUI.error("Reconciliation failed. Resetting downstream.")
-                            await db.execute("UPDATE tasks SET status = 'pending', commit_sha = NULL WHERE arc_id = ? AND id >= (SELECT id FROM tasks WHERE arc_id = ? AND task_id = ?)", (arc_id, arc_id, task.id))
-                            await db.commit()
+            index = 0
+            while index < len(plan.tasks):
+                task = plan.tasks[index]
+                GateUI.header(f"TASK {index + 1}/{len(plan.tasks)}: {task.id}")
 
-                attempts, success, feedback = 4, False, ""
-                while attempts > 0:
-                    attempts -= 1
-                    if success: break
-                    
-                    sandbox = DockerSandbox(self.target_repo)
-                    out, code = await asyncio.to_thread(sandbox.execute_command, "git reset --hard HEAD && git clean -fdx")
-                    if code != 0: GateUI.warning(f"Cleanup failed: {out}")
-                    
-                    if attempts == 0 and not success:
-                        GateUI.error("MISSION STALLED")
-                        hint = input(f"{C_YELLOW}Final Strategic Hint ('skip' to bypass): {C_END}").strip()
-                        if hint.lower() == 'skip': success = True; break
-                        elif hint: task.description += f"\n\nHINT: {hint}"
-                        attempts = 1 # One last try with user hint
+                if await self._task_is_current(db, arc_id, task, work_repo):
+                    GateUI.success("Task checkpoint is already current; skipping.")
+                    index += 1
+                    continue
 
-                    GateUI.step("🔨", f"Attempting Task... ({attempts+1} tries remaining)")
-                    
-                    # AUTO-ESCALATION LOGIC
-                    temp_boost = 0.0
-                    escalation_prefix = ""
-                    if attempts <= 1: # Last two attempts
-                        temp_boost = 0.4
-                        escalation_prefix = "CRITICAL CORRECTION REQUIRED: You have failed previous attempts. You MUST address the feedback below perfectly while maintaining all original constraints."
+                success, plan = await self._execute_task(
+                    db=db,
+                    arc_id=arc_id,
+                    issue_id=issue_id,
+                    issue_description=issue_description,
+                    repo_context=repo_context,
+                    discovery_report=discovery_report,
+                    plan=plan,
+                    task=task,
+                    work_repo=work_repo,
+                    all_diffs=all_diffs,
+                    active_rules=active_rules,
+                    active_rules_text=active_rules_text,
+                )
+                if not success:
+                    await self._fail_arc(db, arc_id)
+                    return False
+                await self._persist_tasks(db, arc_id, plan)
+                index += 1
 
-                    # DESIGN
-                    design_req = f"{escalation_prefix}\nTask: {task.id}\n{task.description}\nConstraints: {task.design_constraints}\n{feedback}\nProvide TypeScript design."
-                    design_messages = [{"role": "system", "content": DESIGNER_PROMPT}, {"role": "user", "content": design_req}]
-                    design_proposal, _ = await LLMClient.chat(model_id=self.config.executor_model, messages=design_messages, temperature=0.3 + temp_boost)
-                    
-                    d_gate = await self.gatekeeper.review_design(task, design_proposal)
-                    GateUI.gate_result("DESIGN", d_gate.approved, d_gate.critique)
-                    if not d_gate.approved: feedback = f"Design Rejected: {d_gate.critique}"; continue
-                    
-                    # EXECUTION
-                    worker_res = await self.worker.invoke({"guidelines": self.guidelines, "repo_path": self.target_repo, "repo_context": repo_context, "discovery_report": discovery_report, "approved_design": design_proposal, "task_memory": task_memory}, task)
-                    w_out = worker_res.output
-                    
-                    # CODE REVIEW
-                    cr_gate = await self.gatekeeper.codereview(task, w_out)
-                    GateUI.gate_result("CODE", cr_gate.approved, cr_gate.critique)
-                    
-                    if cr_gate.approved:
-                        if not task.target_file:
-                            GateUI.success("Analysis finished.")
-                            await db.execute("INSERT INTO tasks (arc_id, task_id, status) VALUES (?, ?, 'completed')", (arc_id, task.id))
-                            await db.commit(); success = True; break
-                        
-                        filepath = f"{self.target_repo}/{task.target_file}"
-                        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                        existing = ""
-                        if os.path.exists(filepath):
-                            with open(filepath, "r") as f: existing = f.read()
-                        try:
-                            updated = self.apply_patches(existing, w_out.diff)
-                            # HARDENING: Prefix with .tmp. to preserve extension (e.g. .tmp.types.ts)
-                            tmp_dir = os.path.dirname(task.target_file)
-                            tmp_base = f".tmp.{os.path.basename(task.target_file)}"
-                            tmp_rel = os.path.join(tmp_dir, tmp_base)
-                            sandbox.write_file(tmp_rel, updated)
+            release_files = self._changed_files_between(work_repo, base_sha, "HEAD")
+            if release_files:
+                GateUI.step("verify", "Running final release verification.")
+                final_verifier = VerifierEngine(DockerSandbox(str(work_repo)), planner_model=self.config.planner_model)
+                final_result = await final_verifier.verify_release(repo_context, release_files)
+                await self._record_verification(db, arc_id, None, final_result, 1, release_files)
+                if not final_result.success:
+                    GateUI.error("Final release verification failed.", final_result.reason)
+                    await self._fail_arc(db, arc_id)
+                    return False
 
-                            if task.target_file.endswith(".ts"):
-                                GateUI.step("🔍", "Linter checking...")
-                                lint_cmd = f"npx tsc --noEmit {tmp_rel} --skipLibCheck --target esnext --module commonjs"
-                                _, code = await asyncio.to_thread(sandbox.execute_command, lint_cmd)
-                                if code != 0: raise ValueError("Linter detected errors.")
+            if all_diffs:
+                system_gate = await self.gatekeeper.review_code(issue_description, plan, all_diffs, active_rules_text)
+                await self._record_gate(db, arc_id, None, "review_code", system_gate, 1)
+                GateUI.gate_result("system", system_gate.approved, system_gate.critique)
+                if not system_gate.approved:
+                    await self._fail_arc(db, arc_id)
+                    return False
 
-                                if l_code != 0: GateUI.warning(f"Linter found issues: {l_out}"); raise ValueError("Linter failed.")
-
-                            # FINAL COMMIT
-                            sandbox.write_file(task.target_file, updated)
-                            with open(filepath, "w") as f: f.write(updated)
-                            
-                            ver = await VerifierEngine(sandbox=sandbox).verify(task.description, repo_context, [task.target_file])
-                            if not ver.success: feedback = f"Reality Check: {ver.reason}"; continue
-                            
-                            # --- CAPTURE STATE ---
-                            GateUI.step("💾", "Capturing state...")
-                            checkpoint_cmd = f"git add . && (git commit -m 'GATE: {task.id}' || echo 'No changes') && git rev-parse HEAD"
-                            sha_out, sha_code = await asyncio.to_thread(sandbox.execute_command, checkpoint_cmd)
-                            if sha_code != 0: GateUI.error("Checkpoint failed.", sha_out); raise ValueError("Git checkpoint failed.")
-                            final_sha = sha_out.strip().split('\n')[-1]
-                            
-                            await db.execute("UPDATE tasks SET status = 'completed', commit_sha = ?, updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?", (final_sha, arc_id, task.id))
-                            await db.commit()
-                            
-                            GateUI.success(f"Finalized at state {final_sha[:7]}.")
-                            all_diffs.append(w_out); success = True; break
-                        except Exception as e: feedback = str(e); continue
-                    else: feedback = cr_gate.critique
-                if not success: return False
-            GateUI.header("🏁 MISSION COMPLETE")
+            await db.execute(
+                "UPDATE release_arcs SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (arc_id,),
+            )
+            await db.commit()
+            await self._mine_rules(db, arc_id)
+            GateUI.header("MISSION COMPLETE")
+            GateUI.success(f"Execution repo: {work_repo}")
             return True
-        except Exception as e: GateUI.error(f"FATAL: {str(e)}"); traceback.print_exc(); return False
+        except Exception as exc:
+            GateUI.error(f"Fatal pipeline error: {exc}")
+            traceback.print_exc()
+            return False
+
+    async def gather_context(self, repo_path: Path) -> str:
+        sandbox = DockerSandbox(str(repo_path))
+        structure_out, _ = await asyncio.to_thread(
+            sandbox.execute_command,
+            "find . -maxdepth 3 -not -path '*/.*' -not -path './node_modules/*' 2>/dev/null | head -n 250",
+        )
+        docs = []
+        for doc in ("AGENTS.md", "README.md", "package.json"):
+            content = sandbox.read_file(doc)
+            if "[File does not exist]" not in content:
+                docs.append(f"--- {doc} ---\n{content[:2000]}")
+        return f"STRUCTURE:\n{structure_out}\n\nDOCS:\n" + "\n".join(docs)
+
+    async def _execute_task(
+        self,
+        db,
+        arc_id: int,
+        issue_id: str,
+        issue_description: str,
+        repo_context: str,
+        discovery_report: str,
+        plan: SupervisorPlan,
+        task: TaskDefinition,
+        work_repo: Path,
+        all_diffs: List[WorkerResult],
+        active_rules: List[Rule],
+        active_rules_text: str,
+    ) -> tuple[bool, SupervisorPlan]:
+        feedback = ""
+        repair_brief = ""
+        failure_history: List[FailureAnalysis] = []
+        changed_file_history: List[List[str]] = []
+        plan_repairs = 0
+        prompt_rewrites = 0
+
+        for attempt in range(1, self.config.max_task_attempts + 1):
+            self._reset_worktree(work_repo)
+            await db.execute(
+                "UPDATE tasks SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?",
+                (arc_id, task.id),
+            )
+            await db.commit()
+
+            route = self.model_router.route(failure_history[-1] if failure_history else None, attempt)
+            self.supervisor.model_id = route.planner_model
+            self.gatekeeper.model_id = route.verifier_model
+
+            GateUI.step("worker", f"Running Codex attempt {attempt}/{self.config.max_task_attempts}.")
+            worker_context = {
+                "repo_path": str(work_repo),
+                "guidelines": self.guidelines,
+                "repo_context": repo_context,
+                "discovery_report": discovery_report,
+                "issue_description": issue_description,
+                "feedback": feedback,
+                "repair_brief": repair_brief,
+                "active_rules": active_rules_text,
+            }
+            prompt = self.worker.build_prompt(worker_context, task)
+            prompt_digest = prompt_hash(prompt)
+            await self._record_prompt_rewrite(
+                db,
+                arc_id,
+                task.id,
+                attempt,
+                prompt_digest,
+                repair_brief or "initial_prompt",
+                [rule.id for rule in active_rules],
+                route.reason,
+            )
+            worker_result = await self.worker.invoke(
+                worker_context,
+                task,
+            )
+            if not worker_result.success:
+                analysis = await self._handle_failed_attempt(
+                    db=db,
+                    arc_id=arc_id,
+                    task=task,
+                    attempt=attempt,
+                    changed_files=[],
+                    worker_error=str(worker_result.output),
+                    failure_history=failure_history,
+                    changed_file_history=changed_file_history,
+                )
+                failure_history.append(analysis)
+                stop_reason = self.circuit_breaker.should_stop(
+                    analyses=failure_history,
+                    changed_file_history=changed_file_history,
+                    latest_changed_files=[],
+                )
+                if stop_reason:
+                    GateUI.error("Circuit breaker stopped retries.", stop_reason)
+                    break
+                feedback, repair_brief, prompt_rewrites = self._next_repair_prompt(
+                    task=task,
+                    issue_description=issue_description,
+                    analysis=analysis,
+                    changed_files=[],
+                    prior_diff="",
+                    active_rules=active_rules,
+                    prompt_rewrites=prompt_rewrites,
+                )
+                GateUI.warning(feedback)
+                continue
+
+            changed_files = self._changed_files(work_repo)
+            changed_file_history.append(changed_files)
+            diff = self._diff(work_repo)
+            w_out: WorkerResult = worker_result.output
+            w_out.changed_files = changed_files
+            w_out.diff = diff
+
+            allowlist_error = self._validate_changed_files(task, changed_files)
+            if allowlist_error:
+                analysis = await self._handle_failed_attempt(
+                    db=db,
+                    arc_id=arc_id,
+                    task=task,
+                    attempt=attempt,
+                    changed_files=changed_files,
+                    allowlist_error=allowlist_error,
+                    failure_history=failure_history,
+                    changed_file_history=changed_file_history,
+                )
+                failure_history.append(analysis)
+                stop_reason = self.circuit_breaker.should_stop(
+                    analyses=failure_history,
+                    changed_file_history=changed_file_history,
+                    latest_changed_files=changed_files,
+                )
+                if stop_reason:
+                    GateUI.error("Circuit breaker stopped retries.", stop_reason)
+                    break
+                if analysis.recommended_action == "repair_plan" and plan_repairs < self.config.max_plan_repairs:
+                    plan, task, plan_repairs = await self._repair_plan(
+                        db=db,
+                        arc_id=arc_id,
+                        issue_id=issue_id,
+                        issue_description=issue_description,
+                        plan=plan,
+                        task=task,
+                        analysis=analysis,
+                        changed_files=changed_files,
+                        plan_repairs=plan_repairs,
+                    )
+                    feedback = f"Plan repaired after {analysis.failure_class}; retrying with updated allowlist/context."
+                    repair_brief = feedback
+                else:
+                    feedback, repair_brief, prompt_rewrites = self._next_repair_prompt(
+                        task=task,
+                        issue_description=issue_description,
+                        analysis=analysis,
+                        changed_files=changed_files,
+                        prior_diff=diff,
+                        active_rules=active_rules,
+                        prompt_rewrites=prompt_rewrites,
+                    )
+                GateUI.warning(feedback)
+                continue
+
+            if self.config.allow_dependency_install:
+                bootstrap_error = self._bootstrap_dependencies(work_repo, changed_files)
+                if bootstrap_error:
+                    analysis = await self._handle_failed_attempt(
+                        db=db,
+                        arc_id=arc_id,
+                        task=task,
+                        attempt=attempt,
+                        changed_files=changed_files,
+                        worker_error=bootstrap_error,
+                        failure_history=failure_history,
+                        changed_file_history=changed_file_history,
+                    )
+                    failure_history.append(analysis)
+                    GateUI.error("Dependency bootstrap failed.", bootstrap_error)
+                    break
+                changed_files = self._changed_files(work_repo)
+                w_out.changed_files = changed_files
+                w_out.diff = self._diff(work_repo)
+
+                allowlist_error = self._validate_changed_files(task, changed_files)
+                if allowlist_error:
+                    analysis = await self._handle_failed_attempt(
+                        db=db,
+                        arc_id=arc_id,
+                        task=task,
+                        attempt=attempt,
+                        changed_files=changed_files,
+                        allowlist_error=allowlist_error,
+                        failure_history=failure_history,
+                        changed_file_history=changed_file_history,
+                    )
+                    failure_history.append(analysis)
+                    if analysis.recommended_action == "repair_plan" and plan_repairs < self.config.max_plan_repairs:
+                        plan, task, plan_repairs = await self._repair_plan(
+                            db=db,
+                            arc_id=arc_id,
+                            issue_id=issue_id,
+                            issue_description=issue_description,
+                            plan=plan,
+                            task=task,
+                            analysis=analysis,
+                            changed_files=changed_files,
+                            plan_repairs=plan_repairs,
+                        )
+                        feedback = f"Plan repaired after dependency-generated allowlist change; retrying."
+                        repair_brief = feedback
+                    else:
+                        feedback, repair_brief, prompt_rewrites = self._next_repair_prompt(
+                            task=task,
+                            issue_description=issue_description,
+                            analysis=analysis,
+                            changed_files=changed_files,
+                            prior_diff=w_out.diff,
+                            active_rules=active_rules,
+                            prompt_rewrites=prompt_rewrites,
+                        )
+                    GateUI.warning(feedback)
+                    continue
+
+            verifier = VerifierEngine(DockerSandbox(str(work_repo)), planner_model=self.config.planner_model)
+            verification = await verifier.verify(
+                task_description=task.description,
+                repo_context=repo_context,
+                changed_files=changed_files,
+                acceptance_criteria=task.acceptance_criteria,
+            )
+            await self._record_verification(db, arc_id, task.id, verification, attempt, changed_files)
+            if not verification.success:
+                analysis = await self._handle_failed_attempt(
+                    db=db,
+                    arc_id=arc_id,
+                    task=task,
+                    attempt=attempt,
+                    changed_files=changed_files,
+                    verifier_result=verification,
+                    failure_history=failure_history,
+                    changed_file_history=changed_file_history,
+                )
+                failure_history.append(analysis)
+                stop_reason = self.circuit_breaker.should_stop(
+                    analyses=failure_history,
+                    changed_file_history=changed_file_history,
+                    latest_changed_files=changed_files,
+                )
+                if stop_reason:
+                    GateUI.error("Circuit breaker stopped retries.", stop_reason)
+                    break
+                if analysis.recommended_action == "repair_plan" and plan_repairs < self.config.max_plan_repairs:
+                    plan, task, plan_repairs = await self._repair_plan(
+                        db=db,
+                        arc_id=arc_id,
+                        issue_id=issue_id,
+                        issue_description=issue_description,
+                        plan=plan,
+                        task=task,
+                        analysis=analysis,
+                        changed_files=changed_files,
+                        plan_repairs=plan_repairs,
+                    )
+                    feedback = f"Plan repaired after {analysis.failure_class}; retrying."
+                    repair_brief = feedback
+                elif analysis.recommended_action == "block_environment":
+                    GateUI.error("Deterministic environment/dependency failure.", verification.reason)
+                    break
+                else:
+                    feedback, repair_brief, prompt_rewrites = self._next_repair_prompt(
+                        task=task,
+                        issue_description=issue_description,
+                        analysis=analysis,
+                        changed_files=changed_files,
+                        prior_diff=w_out.diff,
+                        verifier_result=verification,
+                        active_rules=active_rules,
+                        prompt_rewrites=prompt_rewrites,
+                    )
+                GateUI.warning(feedback)
+                continue
+
+            code_gate = await self.gatekeeper.codereview(task, w_out, active_rules_text)
+            await self._record_gate(db, arc_id, task.id, "codereview", code_gate, attempt)
+            GateUI.gate_result("code", code_gate.approved, code_gate.critique)
+            if not code_gate.approved:
+                analysis = await self._handle_failed_attempt(
+                    db=db,
+                    arc_id=arc_id,
+                    task=task,
+                    attempt=attempt,
+                    changed_files=changed_files,
+                    gate_critique=code_gate.critique,
+                    failure_history=failure_history,
+                    changed_file_history=changed_file_history,
+                )
+                failure_history.append(analysis)
+                if analysis.recommended_action == "repair_plan" and plan_repairs < self.config.max_plan_repairs:
+                    plan, task, plan_repairs = await self._repair_plan(
+                        db=db,
+                        arc_id=arc_id,
+                        issue_id=issue_id,
+                        issue_description=issue_description,
+                        plan=plan,
+                        task=task,
+                        analysis=analysis,
+                        changed_files=changed_files,
+                        plan_repairs=plan_repairs,
+                    )
+                    feedback = f"Plan repaired after Gatekeeper critique; retrying."
+                    repair_brief = feedback
+                else:
+                    feedback, repair_brief, prompt_rewrites = self._next_repair_prompt(
+                        task=task,
+                        issue_description=issue_description,
+                        analysis=analysis,
+                        changed_files=changed_files,
+                        prior_diff=w_out.diff,
+                        gate_critique=code_gate.critique,
+                        active_rules=active_rules,
+                        prompt_rewrites=prompt_rewrites,
+                    )
+                continue
+
+            commit_sha = self._commit_exact_files(work_repo, changed_files, task.id)
+            await db.execute(
+                "UPDATE tasks SET status = 'completed', commit_sha = ?, updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?",
+                (commit_sha, arc_id, task.id),
+            )
+            await db.commit()
+
+            all_diffs.append(w_out)
+            GateUI.success(f"Task finalized at {commit_sha[:8]}.")
+            return True, plan
+
+        await db.execute(
+            "UPDATE tasks SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?",
+            (arc_id, task.id),
+        )
+        await db.commit()
+        GateUI.error("Task exhausted all attempts.", feedback)
+        return False, plan
+
+    async def _load_or_create_plan(
+        self,
+        db,
+        arc_id: int,
+        issue_id: str,
+        issue_description: str,
+        repo_context: str,
+        discovery_report: str,
+        manual_plan: Optional[SupervisorPlan],
+        active_rules_text: str,
+    ) -> Optional[SupervisorPlan]:
+        plan = manual_plan or self._load_plan_file(issue_id)
+        guidelines = f"{self.guidelines}\n\nAPPROVED LEARNED RULES:\n{active_rules_text}"
+
+        if not plan:
+            GateUI.step("plan", "Drafting implementation plan.")
+            plan_result = await self.supervisor.invoke(
+                {
+                    "guidelines": guidelines,
+                    "repo_path": str(self.source_repo),
+                    "repo_context": repo_context,
+                    "discovery_report": discovery_report,
+                },
+                issue_description,
+            )
+            if not plan_result.success:
+                GateUI.error("Supervisor failed to create a plan.", str(plan_result.output))
+                return None
+            plan = plan_result.output
+
+        for attempt in range(1, 4):
+            plan_gate = await self.gatekeeper.review_plan(issue_description, plan, active_rules_text)
+            await self._record_gate(db, arc_id, None, "review_plan", plan_gate, attempt)
+            GateUI.gate_result("plan", plan_gate.approved, plan_gate.critique)
+            if plan_gate.approved:
+                self._write_plan_file(issue_id, issue_description, plan)
+                if await self._latest_plan_version(db, arc_id) == 0:
+                    await self._record_plan_version(db, arc_id, 1, plan, "initial_approved_plan", None)
+                return plan
+
+            revision = await self.supervisor.revise_plan(
+                plan,
+                plan_gate.critique,
+                {
+                    "guidelines": guidelines,
+                    "repo_path": str(self.source_repo),
+                    "repo_context": repo_context,
+                    "discovery_report": discovery_report,
+                },
+            )
+            if not revision.success:
+                GateUI.error("Supervisor failed to revise rejected plan.", str(revision.output))
+                return None
+            plan = revision.output
+
+        GateUI.error("Plan rejected after revision attempts.")
+        return None
+
+    def _load_plan_file(self, issue_id: str) -> Optional[SupervisorPlan]:
+        plan_file = self.metadata_dir / f"PLAN_{issue_id}.md"
+        if not plan_file.exists():
+            return None
+        content = plan_file.read_text(encoding="utf-8")
+        try:
+            json_str = content.split("```json", 1)[1].split("```", 1)[0].strip()
+            return SupervisorPlan(tasks=[TaskDefinition(**task) for task in json.loads(json_str)])
+        except (IndexError, json.JSONDecodeError, TypeError) as exc:
+            GateUI.warning(f"Could not parse existing plan file: {exc}")
+            return None
+
+    def _write_plan_file(self, issue_id: str, issue_description: str, plan: SupervisorPlan) -> None:
+        plan_file = self.metadata_dir / f"PLAN_{issue_id}.md"
+        payload = [task.model_dump() for task in plan.tasks]
+        plan_file.write_text(
+            f"# Implementation Plan for {issue_id}\n\n"
+            f"## Original Requirement\n{issue_description}\n\n"
+            f"## Execution Tasks\n```json\n{json.dumps(payload, indent=2)}\n```\n",
+            encoding="utf-8",
+        )
+
+    async def _persist_tasks(self, db, arc_id: int, plan: SupervisorPlan) -> None:
+        for task in plan.tasks:
+            async with db.execute(
+                "SELECT id FROM tasks WHERE arc_id = ? AND task_id = ? ORDER BY id DESC LIMIT 1",
+                (arc_id, task.id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            target_files = json.dumps(task.allowed_files)
+            dependencies = json.dumps(task.dependencies)
+            if row:
+                await db.execute(
+                    "UPDATE tasks SET description = ?, dependencies = ?, target_files = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (task.description, dependencies, target_files, row[0]),
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO tasks (arc_id, task_id, description, dependencies, target_files, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                    (arc_id, task.id, task.description, dependencies, target_files),
+                )
+        await db.commit()
+
+    async def _task_is_current(self, db, arc_id: int, task: TaskDefinition, work_repo: Path) -> bool:
+        async with db.execute(
+            "SELECT status, commit_sha FROM tasks WHERE arc_id = ? AND task_id = ? ORDER BY id DESC LIMIT 1",
+            (arc_id, task.id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row or row[0] != "completed" or not row[1]:
+            return False
+
+        actual_sha = self._git(work_repo, ["rev-parse", "HEAD"]).strip()
+        if actual_sha != row[1]:
+            return False
+        return all((work_repo / path).is_file() for path in task.allowed_files)
+
+    async def _get_or_create_arc(self, db, issue_id: str) -> int:
+        async with db.execute(
+            "SELECT id FROM release_arcs WHERE issue_id = ? AND status != 'completed' ORDER BY id DESC LIMIT 1",
+            (issue_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row:
+            return row[0]
+
+        cursor = await db.execute(
+            "INSERT INTO release_arcs (issue_id, repository, status) VALUES (?, ?, 'planning')",
+            (issue_id, str(self.source_repo)),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+    async def _record_gate(
+        self,
+        db,
+        arc_id: int,
+        task_id: Optional[str],
+        gate_name: str,
+        result: GateResult,
+        attempt_number: int,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO gate_reviews (
+                arc_id, task_id, gate_name, model_id, status, error_type,
+                critique_summary, attempt_number, prompt_tokens, completion_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                arc_id,
+                task_id,
+                gate_name,
+                self.gatekeeper.model_id,
+                "approved" if result.approved else "rejected",
+                result.error_type,
+                result.critique,
+                attempt_number,
+                result.metrics.get("prompt_tokens", 0),
+                result.metrics.get("completion_tokens", 0),
+            ),
+        )
+        await db.commit()
+
+    async def _record_verification(
+        self,
+        db,
+        arc_id: int,
+        task_id: Optional[str],
+        result: VerificationResult,
+        attempt_number: int,
+        changed_files: List[str],
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO verification_runs (
+                arc_id, task_id, status, reason, used_command, evidence,
+                changed_files, attempt_number
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                arc_id,
+                task_id,
+                "passed" if result.success else "failed",
+                result.reason,
+                result.used_command,
+                result.evidence,
+                json.dumps(changed_files),
+                attempt_number,
+            ),
+        )
+        await db.commit()
+
+    async def _handle_failed_attempt(
+        self,
+        db,
+        arc_id: int,
+        task: TaskDefinition,
+        attempt: int,
+        changed_files: List[str],
+        failure_history: List[FailureAnalysis],
+        changed_file_history: List[List[str]],
+        verifier_result: Optional[VerificationResult] = None,
+        gate_critique: str = "",
+        allowlist_error: str = "",
+        worker_error: str = "",
+    ) -> FailureAnalysis:
+        analysis = self.failure_analyzer.analyze(
+            task=task,
+            attempt=attempt,
+            changed_files=changed_files,
+            verifier_result=verifier_result,
+            gate_critique=gate_critique,
+            allowlist_error=allowlist_error,
+            worker_error=worker_error,
+            previous_failures=failure_history,
+        )
+        await db.execute(
+            """
+            INSERT INTO failure_analyses (
+                arc_id, task_id, attempt_number, failure_class, confidence,
+                evidence, recommended_action, changed_files
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                arc_id,
+                task.id,
+                attempt,
+                analysis.failure_class,
+                analysis.confidence,
+                analysis.evidence,
+                analysis.recommended_action,
+                json.dumps(changed_files),
+            ),
+        )
+        await db.commit()
+        GateUI.step("analyze", f"{analysis.failure_class} -> {analysis.recommended_action} ({analysis.confidence:.2f})")
+        return analysis
+
+    def _next_repair_prompt(
+        self,
+        *,
+        task: TaskDefinition,
+        issue_description: str,
+        analysis: FailureAnalysis,
+        changed_files: List[str],
+        prior_diff: str,
+        active_rules: List[Rule],
+        prompt_rewrites: int,
+        verifier_result: Optional[VerificationResult] = None,
+        gate_critique: str = "",
+    ) -> tuple[str, str, int]:
+        if prompt_rewrites >= self.config.max_prompt_rewrites:
+            return (
+                f"Prompt rewrite budget exhausted after {prompt_rewrites} rewrite(s).",
+                "",
+                prompt_rewrites,
+            )
+
+        rewrite = self.prompt_rewriter.rewrite(
+            task=task,
+            issue_description=issue_description,
+            analysis=analysis,
+            changed_files=changed_files,
+            prior_diff=prior_diff,
+            verifier_result=verifier_result,
+            gate_critique=gate_critique,
+            active_rules=active_rules,
+        )
+        return rewrite.rewrite_summary, rewrite.repair_brief, prompt_rewrites + 1
+
+    async def _repair_plan(
+        self,
+        *,
+        db,
+        arc_id: int,
+        issue_id: str,
+        issue_description: str,
+        plan: SupervisorPlan,
+        task: TaskDefinition,
+        analysis: FailureAnalysis,
+        changed_files: List[str],
+        plan_repairs: int,
+    ) -> tuple[SupervisorPlan, TaskDefinition, int]:
+        completed_task_ids = await self._completed_task_ids(db, arc_id)
+        repaired, reason = self.plan_repairer.repair(
+            plan=plan,
+            failed_task=task,
+            analysis=analysis,
+            changed_files=changed_files,
+            completed_task_ids=completed_task_ids,
+        )
+        parent_version = await self._latest_plan_version(db, arc_id)
+        version = parent_version + 1
+        await self._record_plan_version(db, arc_id, version, repaired, reason, parent_version)
+        await self._persist_tasks(db, arc_id, repaired)
+        self._write_plan_file(issue_id, issue_description, repaired)
+        repaired_task = next((candidate for candidate in repaired.tasks if candidate.id == task.id), task)
+        GateUI.step("plan", f"Recorded repaired plan version {version}.")
+        return repaired, repaired_task, plan_repairs + 1
+
+    async def _completed_task_ids(self, db, arc_id: int) -> set[str]:
+        async with db.execute(
+            "SELECT task_id FROM tasks WHERE arc_id = ? AND status = 'completed'",
+            (arc_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return {row["task_id"] for row in rows if row["task_id"]}
+
+    async def _record_plan_version(
+        self,
+        db,
+        arc_id: int,
+        version: int,
+        plan: SupervisorPlan,
+        reason: str,
+        parent_version: Optional[int],
+    ) -> None:
+        payload = json.dumps([task.model_dump() for task in plan.tasks], indent=2)
+        await db.execute(
+            """
+            INSERT INTO plan_versions (arc_id, version, plan_json, reason, parent_version)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (arc_id, version, payload, reason, parent_version),
+        )
+        await db.commit()
+
+    async def _latest_plan_version(self, db, arc_id: int) -> int:
+        async with db.execute(
+            "SELECT COALESCE(MAX(version), 0) AS version FROM plan_versions WHERE arc_id = ?",
+            (arc_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["version"] or 0)
+
+    async def _record_prompt_rewrite(
+        self,
+        db,
+        arc_id: int,
+        task_id: str,
+        attempt: int,
+        prompt_digest: str,
+        rewrite_summary: str,
+        active_rule_ids: List[str],
+        model_route: str,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO prompt_rewrites (
+                arc_id, task_id, attempt_number, prompt_hash, rewrite_summary,
+                active_rules_used, model_route
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                arc_id,
+                task_id,
+                attempt,
+                prompt_digest,
+                rewrite_summary[:1000],
+                json.dumps(active_rule_ids),
+                model_route,
+            ),
+        )
+        await db.commit()
+
+    async def _mine_rules(self, db, arc_id: int) -> None:
+        proposals = await self.rule_miner.mine_arc(db, arc_id, self.project_name)
+        if not proposals:
+            GateUI.step("rules", "No new durable rule proposals.")
+            return
+
+        GateUI.step("rules", f"Proposed {len(proposals)} inactive learned rule(s).")
+        for proposal in proposals[:5]:
+            GateUI.warning(
+                f"rule_proposal #{proposal['id']} [{proposal['scope']}] "
+                f"{proposal['rule_text']} (confidence {proposal['confidence']:.2f})"
+            )
+        if self.config.rule_mode == "review_first":
+            GateUI.step("rules", "Review proposals in rule_proposals; set status='approved' to activate.")
+
+    async def _fail_arc(self, db, arc_id: int) -> None:
+        await self._mark_arc_failed(db, arc_id)
+        await self._mine_rules(db, arc_id)
+
+    async def _migrate_ledger(self, db) -> None:
+        migrations = [
+            "ALTER TABLE tasks ADD COLUMN commit_sha TEXT",
+            "ALTER TABLE tasks ADD COLUMN target_files TEXT",
+            """
+            CREATE TABLE IF NOT EXISTS verification_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                arc_id INTEGER NOT NULL,
+                task_id TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                used_command TEXT,
+                evidence TEXT,
+                changed_files TEXT,
+                attempt_number INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (arc_id) REFERENCES release_arcs(id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS failure_analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                arc_id INTEGER NOT NULL,
+                task_id TEXT,
+                attempt_number INTEGER DEFAULT 1,
+                failure_class TEXT NOT NULL,
+                confidence REAL DEFAULT 0,
+                evidence TEXT,
+                recommended_action TEXT,
+                changed_files TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (arc_id) REFERENCES release_arcs(id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS plan_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                arc_id INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                plan_json TEXT NOT NULL,
+                reason TEXT,
+                parent_version INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (arc_id) REFERENCES release_arcs(id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rule_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_text TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'global',
+                source_failures TEXT,
+                confidence REAL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS prompt_rewrites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                arc_id INTEGER NOT NULL,
+                task_id TEXT,
+                attempt_number INTEGER DEFAULT 1,
+                prompt_hash TEXT NOT NULL,
+                rewrite_summary TEXT,
+                active_rules_used TEXT,
+                model_route TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (arc_id) REFERENCES release_arcs(id)
+            )
+            """,
+        ]
+        for migration in migrations:
+            try:
+                await db.execute(migration)
+                await db.commit()
+            except Exception:
+                pass
+
+        try:
+            await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_arc_task ON tasks(arc_id, task_id)")
+            await db.commit()
+        except Exception:
+            GateUI.warning("Task table contains duplicate task rows; future inserts will still use latest-row reconciliation.")
+
+    async def _mark_arc_failed(self, db, arc_id: int) -> None:
+        await db.execute(
+            "UPDATE release_arcs SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (arc_id,),
+        )
+        await db.commit()
+
+    def _ensure_git_repo(self, repo: Path) -> None:
+        if not repo.exists():
+            raise FileNotFoundError(f"Target repository does not exist: {repo}")
+
+        is_repo = self._run(["git", "rev-parse", "--is-inside-work-tree"], repo, check=False).strip() == "true"
+        if not is_repo:
+            self._run(["git", "init"], repo)
+
+        self._run(["git", "config", "user.email", "gate@sevisolutions.com"], repo)
+        self._run(["git", "config", "user.name", "Gatekeeper"], repo)
+
+        has_head = self._run(["git", "rev-parse", "--verify", "HEAD"], repo, check=False)
+        if "fatal" in has_head.lower() or not has_head.strip():
+            self._run(["git", "commit", "--allow-empty", "-m", "GATE Init"], repo)
+
+    def _prepare_execution_repo(self, issue_id: str, arc_id: int) -> Path:
+        if not self.config.use_git_worktree:
+            return self.source_repo
+
+        slug = self._slug(issue_id)
+        branch = f"gate/{slug}-{arc_id}"
+        worktree_root = Path(os.environ.get("GATE_WORKTREE_ROOT", tempfile.gettempdir())) / "gate-worktrees"
+        worktree_root.mkdir(parents=True, exist_ok=True)
+        worktree = worktree_root / f"{self.project_name}-{slug}-{arc_id}"
+
+        if (worktree / ".git").exists():
+            GateUI.step("worktree", f"Reusing isolated worktree {worktree}.")
+            self._run(["git", "reset", "--hard", "HEAD"], worktree)
+            self._run(["git", "clean", "-fd"], worktree)
+            return worktree
+
+        if worktree.exists():
+            raise RuntimeError(f"Worktree path exists but is not a git worktree: {worktree}")
+
+        GateUI.step("worktree", f"Creating isolated worktree {worktree}.")
+        self._run(["git", "worktree", "add", "-B", branch, str(worktree), "HEAD"], self.source_repo)
+        self._run(["git", "config", "user.email", "gate@sevisolutions.com"], worktree)
+        self._run(["git", "config", "user.name", "Gatekeeper"], worktree)
+        return worktree
+
+    def _reset_worktree(self, work_repo: Path) -> None:
+        self._run(["git", "reset", "--hard", "HEAD"], work_repo)
+        self._run(["git", "clean", "-fd"], work_repo)
+
+    def _bootstrap_dependencies(self, work_repo: Path, changed_files: List[str]) -> Optional[str]:
+        package_dirs = []
+        for rel_path in changed_files:
+            path = work_repo / rel_path
+            current = path.parent
+            while work_repo in [current, *current.parents]:
+                package_json = current / "package.json"
+                if package_json.exists():
+                    package_dirs.append(current)
+                    break
+                if current == work_repo:
+                    break
+                current = current.parent
+
+        for package_dir in sorted(set(package_dirs)):
+            if (package_dir / "node_modules").exists():
+                continue
+            rel_dir = str(package_dir.relative_to(work_repo))
+            GateUI.step("deps", f"Installing dependencies in {rel_dir}.")
+            sandbox = DockerSandbox(str(work_repo))
+            output, code = sandbox.execute_command(f"cd {shlex.quote(rel_dir)} && npm install")
+            if code != 0:
+                return f"Dependency install failed in {rel_dir}: {output[:1200]}"
+        return None
+
+    def _validate_changed_files(self, task: TaskDefinition, changed_files: List[str]) -> Optional[str]:
+        if not changed_files:
+            return "Codex did not produce any file changes."
+
+        temp_files = [path for path in changed_files if self._is_temp_artifact(path)]
+        if temp_files:
+            return f"Codex produced forbidden temporary artifacts: {', '.join(temp_files)}"
+
+        protected = self._protected_gate_source_changes(changed_files)
+        if protected:
+            return (
+                "Autonomous arcs may not modify GATE source-control paths. "
+                f"Protected changes: {protected}. Generate a proposal instead."
+            )
+
+        allowed = set(self._normalize_files(task.allowed_files))
+        if not allowed:
+            return None
+        allowed = set(self._with_generated_lockfiles(allowed))
+
+        unexpected = [path for path in changed_files if path not in allowed]
+        if unexpected:
+            return (
+                "Codex modified files outside the task allowlist. "
+                f"Allowed: {sorted(allowed)}. Unexpected: {unexpected}"
+            )
+        return None
+
+    def _with_generated_lockfiles(self, allowed: set[str]) -> List[str]:
+        expanded = set(allowed)
+        for rel_path in allowed:
+            if rel_path.endswith("package.json"):
+                package_dir = os.path.dirname(rel_path)
+                lockfile = os.path.join(package_dir, "package-lock.json") if package_dir else "package-lock.json"
+                expanded.add(lockfile)
+        return sorted(expanded)
+
+    def _protected_gate_source_changes(self, changed_files: List[str]) -> List[str]:
+        if not self.config.protect_gate_source_paths:
+            return []
+        gate_root = Path.cwd().resolve()
+        if self.source_repo != gate_root:
+            return []
+        protected_prefixes = ("agents/", "orchestrator/", "ledger/", "integrations/", "environment/")
+        protected_files = ("trust_ledger.db",)
+        return [
+            path
+            for path in changed_files
+            if path.startswith(protected_prefixes) or path in protected_files
+        ]
+
+    def _commit_exact_files(self, work_repo: Path, files: List[str], task_id: str) -> str:
+        files = self._normalize_files(files)
+        self._run(["git", "add", "--", *files], work_repo)
+        staged = self._git(work_repo, ["diff", "--cached", "--name-only"]).splitlines()
+        if not staged:
+            raise RuntimeError("No staged files after exact-file staging.")
+        self._run(["git", "commit", "-m", f"GATE: {task_id}"], work_repo)
+        return self._git(work_repo, ["rev-parse", "HEAD"]).strip()
+
+    def _changed_files(self, work_repo: Path) -> List[str]:
+        tracked = self._git(work_repo, ["diff", "--name-only"]).splitlines()
+        untracked = self._git(work_repo, ["ls-files", "--others", "--exclude-standard"]).splitlines()
+        return self._normalize_files(sorted({*tracked, *untracked}))
+
+    def _changed_files_between(self, work_repo: Path, base: str, head: str) -> List[str]:
+        output = self._git(work_repo, ["diff", "--name-only", f"{base}..{head}"])
+        return self._normalize_files(output.splitlines())
+
+    def _diff(self, work_repo: Path) -> str:
+        diff = self._git(work_repo, ["diff", "--no-ext-diff", "--binary"]).rstrip()
+        chunks = [diff] if diff else []
+        for rel_path in self._git(work_repo, ["ls-files", "--others", "--exclude-standard"]).splitlines():
+            path = work_repo / rel_path
+            if not path.is_file():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                content = "[binary or non-UTF-8 file omitted]"
+            chunks.append(f"--- /dev/null\n+++ b/{rel_path}\n@@ untracked file @@\n{content[:12000]}")
+        return "\n\n".join(chunk for chunk in chunks if chunk)
+
+    def _git(self, cwd: Path, args: List[str]) -> str:
+        return self._run(["git", *args], cwd, check=False)
+
+    def _run(self, command: List[str], cwd: Path, check: bool = True) -> str:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if check and result.returncode != 0:
+            raise RuntimeError(f"Command failed ({' '.join(command)}): {result.stdout}")
+        return result.stdout
+
+    def _normalize_files(self, files: List[str]) -> List[str]:
+        normalized = []
+        for path in files:
+            path = path.strip()
+            if not path:
+                continue
+            normalized.append(path[2:] if path.startswith("./") else path)
+        return sorted(set(normalized))
+
+    def _is_temp_artifact(self, rel_path: str) -> bool:
+        name = os.path.basename(rel_path)
+        return name.startswith(".tmp") or name.endswith(".tmp") or name.endswith(".bak") or rel_path.endswith(".rej")
+
+    def _slug(self, value: str) -> str:
+        slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-").lower()
+        return slug or "release"
+
 
 if __name__ == "__main__":
     async def run():
         try:
-            session_file = "metadata/LAST_SESSION.json"
-            target_repo, issue_id = None, None
-            if os.path.exists(session_file):
-                with open(session_file, "r") as f: last = json.load(f)
-                if input(f"{C_YELLOW}🔄 Resume {last.get('issue_id')}? [Y/n]: {C_END}").lower() != 'n':
-                    target_repo, issue_id = last.get('repo'), last.get('issue_id')
-            if not target_repo: target_repo = input("Target Repo: ").strip() or "."
-            project_name = os.path.basename(target_repo.rstrip("/"))
-            metadata_dir = f"metadata/{project_name}"
-            os.makedirs(metadata_dir, exist_ok=True)
-            config_path = os.path.join(metadata_dir, "gate.yml")
-            project_guidelines = "Standard practices."
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f: cfg = yaml.safe_load(f)
-                project_guidelines = f"GOAL: {cfg.get('project_goal', '')}\nSTACK: {cfg.get('technical_stack', '')}\nARCH: {cfg.get('architecture', '')}\nRULES: {cfg.get('guidelines', '')}"
-            orch = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=project_guidelines)
-            if not issue_id: issue_id = input("Issue ID: ").strip()
-            with open(session_file, "w") as f: json.dump({"repo": target_repo, "issue_id": issue_id}, f)
-            plan_file = os.path.join(metadata_dir, f"PLAN_{issue_id}.md")
-            desc = ""
-            if os.path.exists(plan_file):
-                with open(plan_file, "r") as f:
-                    content = f.read()
-                    if "## Original Requirement\n" in content: desc = content.split("## Original Requirement\n")[1].split("## Execution Tasks")[0].strip()
-            if not desc: desc = input("Task Description: ").strip()
-            await orch.process_issue(issue_id, desc)
-        except Exception as e: GateUI.error(f"FATAL: {str(e)}")
-        finally: print(f"{C_GREEN}✨ Shutdown.{C_END}")
+            session_file = Path("metadata/LAST_SESSION.json")
+            target_repo = None
+            issue_id = None
+
+            if session_file.exists():
+                last = json.loads(session_file.read_text(encoding="utf-8"))
+                response = input(f"{C_YELLOW}Resume {last.get('issue_id')}? [Y/n]: {C_END}").strip().lower()
+                if response != "n":
+                    target_repo = last.get("repo")
+                    issue_id = last.get("issue_id")
+
+            if not target_repo:
+                target_repo = input("Target Repo: ").strip() or "."
+
+            project_name = Path(target_repo).resolve().name
+            metadata_dir = Path("metadata") / project_name
+            metadata_dir.mkdir(parents=True, exist_ok=True)
+
+            guidelines = "Standard practices."
+            config_path = metadata_dir / "gate.yml"
+            if config_path.exists():
+                cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                guidelines = (
+                    f"GOAL: {cfg.get('project_goal', '')}\n"
+                    f"STACK: {cfg.get('technical_stack', '')}\n"
+                    f"ARCH: {cfg.get('architecture', '')}\n"
+                    f"RULES: {cfg.get('guidelines', '')}"
+                )
+
+            if not issue_id:
+                issue_id = input("Issue ID: ").strip()
+
+            session_file.write_text(json.dumps({"repo": target_repo, "issue_id": issue_id}), encoding="utf-8")
+
+            plan_file = metadata_dir / f"PLAN_{issue_id}.md"
+            description = ""
+            if plan_file.exists():
+                content = plan_file.read_text(encoding="utf-8")
+                if "## Original Requirement\n" in content:
+                    description = content.split("## Original Requirement\n", 1)[1].split("## Execution Tasks", 1)[0].strip()
+            if not description:
+                description = input("Task Description: ").strip()
+
+            orchestrator = ReleaseArcOrchestrator(target_repo=target_repo, guidelines=guidelines)
+            await orchestrator.process_issue(issue_id, description)
+        except Exception as exc:
+            GateUI.error(f"Fatal startup error: {exc}")
+        finally:
+            print(f"{C_GREEN}Shutdown.{C_END}")
+
     asyncio.run(run())
