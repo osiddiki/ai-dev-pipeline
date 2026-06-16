@@ -90,11 +90,25 @@ You can set "requires_tests": false for tasks involving static content, basic CS
             
             raw_response = response
             try:
+                import re
                 clean_json = raw_response.strip()
-                if '[' in clean_json and ']' in clean_json:
-                    clean_json = clean_json[clean_json.find('['):clean_json.rfind(']')+1]
+                # First try to extract from a markdown code block
+                match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', clean_json, re.DOTALL)
+                if match:
+                    clean_json = match.group(1)
                 else:
+                    # Fallback: find the first [ that looks like an array start
+                    # by stripping all text up to the first [ and after the last ]
+                    start_idx = clean_json.find('[')
+                    end_idx = clean_json.rfind(']')
+                    if start_idx != -1 and end_idx != -1:
+                        # try to parse the biggest possible array
+                        # if it fails, the json.loads will catch it
+                        pass 
                     clean_json = clean_json.replace("```json", "").replace("```", "").strip()
+                    if '[' in clean_json and ']' in clean_json:
+                        clean_json = clean_json[clean_json.find('['):clean_json.rfind(']')+1]
+
                 plan_data = json.loads(clean_json)
                 plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])
                 return AgentResult(success=True, output=plan)
@@ -151,11 +165,16 @@ Output your final revised plan as a JSON array.
             
             raw_response = response
             try:
+                import re
                 clean_json = raw_response.strip()
-                if '[' in clean_json and ']' in clean_json:
-                    clean_json = clean_json[clean_json.find('['):clean_json.rfind(']')+1]
+                match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', clean_json, re.DOTALL)
+                if match:
+                    clean_json = match.group(1)
                 else:
                     clean_json = clean_json.replace("```json", "").replace("```", "").strip()
+                    if '[' in clean_json and ']' in clean_json:
+                        clean_json = clean_json[clean_json.find('['):clean_json.rfind(']')+1]
+
                 plan_data = json.loads(clean_json)
                 revised_plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])
                 return AgentResult(success=True, output=revised_plan)
