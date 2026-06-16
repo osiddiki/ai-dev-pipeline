@@ -69,7 +69,7 @@ class CodebaseTools:
         else:
             return f"Error: Unknown tool '{tool_name}'"
 
-SUPERVISOR_TOOLS_SCHEMA = [
+CODEBASE_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {

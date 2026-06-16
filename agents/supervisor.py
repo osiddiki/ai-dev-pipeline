@@ -3,7 +3,7 @@ from typing import Any, List, Optional
 from pydantic import BaseModel, Field
 from .base import BaseAgent, AgentResult
 from integrations.gemini_client import LLMClient
-from environment.tools import CodebaseTools, SUPERVISOR_TOOLS_SCHEMA
+from environment.tools import CodebaseTools, CODEBASE_TOOLS_SCHEMA
 import structlog
 
 logger = structlog.get_logger()
@@ -69,7 +69,7 @@ Your final response must be ONLY a valid JSON array of tasks matching this schem
                 model_id=self.model_id, 
                 messages=messages, 
                 temperature=temperature,
-                tools=SUPERVISOR_TOOLS_SCHEMA
+                tools=CODEBASE_TOOLS_SCHEMA
             )
             
             if hasattr(response, "tool_calls") and response.tool_calls:
@@ -130,7 +130,7 @@ Output your final revised plan as a JSON array.
                 model_id=self.model_id, 
                 messages=messages, 
                 temperature=temperature,
-                tools=SUPERVISOR_TOOLS_SCHEMA
+                tools=CODEBASE_TOOLS_SCHEMA
             )
             
             if hasattr(response, "tool_calls") and response.tool_calls:

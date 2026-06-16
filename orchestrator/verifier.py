@@ -13,6 +13,48 @@ from environment.mcp_client import PipelineMCPClient
 logger = structlog.get_logger()
 
 
+class FileValidator:
+    def __init__(self, sandbox: PipelineMCPClient, repo_root: Path):
+        self.sandbox = sandbox
+        self.repo_root = repo_root
+        
+    async def validate(self, rel_path: str) -> VerificationResult:
+        raise NotImplementedError()
+
+class JsonValidator(FileValidator):
+    async def validate(self, rel_path: str) -> VerificationResult:
+        script = "const fs=require('fs'); JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));"
+        cmd = f"node -e {shlex.quote(script)} {shlex.quote(rel_path)}"
+        output, code = await self.sandbox.execute_command(cmd)
+        if code != 0:
+            return VerificationResult(success=False, reason=f"Invalid JSON in {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
+        return VerificationResult(success=True, reason=f"JSON parsed: {rel_path}", evidence=cmd)
+
+class JavaScriptValidator(FileValidator):
+    async def validate(self, rel_path: str) -> VerificationResult:
+        cmd = f"node --check {shlex.quote(rel_path)}"
+        output, code = await self.sandbox.execute_command(cmd)
+        if code != 0:
+            return VerificationResult(success=False, reason=f"JavaScript syntax failed for {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
+        return VerificationResult(success=True, reason=f"JavaScript syntax passed: {rel_path}", evidence=cmd)
+
+class PythonValidator(FileValidator):
+    async def validate(self, rel_path: str) -> VerificationResult:
+        cmd = f"python -m py_compile {shlex.quote(rel_path)}"
+        output, code = await self.sandbox.execute_command(cmd)
+        if code != 0:
+            return VerificationResult(success=False, reason=f"Python syntax failed for {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
+        return VerificationResult(success=True, reason=f"Python syntax passed: {rel_path}", evidence=cmd)
+
+class TypeScriptValidator(FileValidator):
+    async def validate(self, rel_path: str) -> VerificationResult:
+        cmd = f"npx tsc --noEmit --skipLibCheck --target esnext --module commonjs {shlex.quote(rel_path)}"
+        output, code = await self.sandbox.execute_command(cmd)
+        if code != 0:
+            return VerificationResult(success=False, reason=f"TypeScript check failed for {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
+        return VerificationResult(success=True, reason=f"TypeScript check passed: {rel_path}", evidence=cmd)
+
+
 class VerifierEngine:
     """Deterministic verifier for GATE task acceptance."""
 
@@ -89,23 +131,29 @@ class VerifierEngine:
         checked = 0
         ts_projects: Set[Path] = set()
 
+        validators = {
+            ".json": JsonValidator(self.sandbox, self.repo_root),
+            ".js": JavaScriptValidator(self.sandbox, self.repo_root),
+            ".ts": TypeScriptValidator(self.sandbox, self.repo_root),
+            ".tsx": TypeScriptValidator(self.sandbox, self.repo_root),
+            ".py": PythonValidator(self.sandbox, self.repo_root),
+        }
+
         for rel_path in changed_files:
             suffix = Path(rel_path).suffix
-            if suffix == ".json":
-                result = await self._check_json(rel_path)
-            elif suffix == ".js":
-                result = await self._check_js(rel_path)
-            elif suffix in {".ts", ".tsx"}:
+            if suffix in {".ts", ".tsx"}:
                 tsconfig = self._nearest_file(rel_path, "tsconfig.json")
                 if tsconfig:
                     ts_projects.add(tsconfig.parent)
                     result = VerificationResult(success=True, reason="Deferred to project TypeScript check.")
                 else:
-                    result = await self._check_ts_file(rel_path)
+                    result = await validators[suffix].validate(rel_path)
+            elif suffix in validators:
+                result = await validators[suffix].validate(rel_path)
             else:
                 result = VerificationResult(success=True, reason="No schema or syntax check required.")
 
-            if suffix in {".json", ".js", ".ts", ".tsx"}:
+            if suffix in validators:
                 checked += 1
             if not result.success:
                 return result
@@ -151,29 +199,19 @@ class VerifierEngine:
                     )
                 evidence.append(f"{cmd}\n{output[:1000]}")
 
+        if (self.repo_root / "tests").exists() or (self.repo_root / "pytest.ini").exists():
+            cmd = "pytest"
+            output, code = await self.sandbox.execute_command(cmd)
+            if code not in (0, 5):
+                return VerificationResult(
+                    success=False,
+                    reason=f"pytest failed: {output[:800]}",
+                    used_command=cmd,
+                    evidence=output[:4000]
+                )
+            evidence.append(f"{cmd}\n{output[:1000]}")
+
         return VerificationResult(success=True, reason="Project checks passed or were not locally runnable.", evidence="\n".join(evidence))
-
-    async def _check_json(self, rel_path: str) -> VerificationResult:
-        script = "const fs=require('fs'); JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));"
-        cmd = f"node -e {shlex.quote(script)} {shlex.quote(rel_path)}"
-        output, code = await self.sandbox.execute_command(cmd)
-        if code != 0:
-            return VerificationResult(success=False, reason=f"Invalid JSON in {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
-        return VerificationResult(success=True, reason=f"JSON parsed: {rel_path}", evidence=cmd)
-
-    async def _check_js(self, rel_path: str) -> VerificationResult:
-        cmd = f"node --check {shlex.quote(rel_path)}"
-        output, code = await self.sandbox.execute_command(cmd)
-        if code != 0:
-            return VerificationResult(success=False, reason=f"JavaScript syntax failed for {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
-        return VerificationResult(success=True, reason=f"JavaScript syntax passed: {rel_path}", evidence=cmd)
-
-    async def _check_ts_file(self, rel_path: str) -> VerificationResult:
-        cmd = f"npx tsc --noEmit --skipLibCheck --target esnext --module commonjs {shlex.quote(rel_path)}"
-        output, code = await self.sandbox.execute_command(cmd)
-        if code != 0:
-            return VerificationResult(success=False, reason=f"TypeScript check failed for {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
-        return VerificationResult(success=True, reason=f"TypeScript check passed: {rel_path}", evidence=cmd)
 
     async def _check_ts_project(self, project_dir: Path) -> VerificationResult:
         rel_dir = self._rel(project_dir)
