@@ -3,10 +3,10 @@ from pydantic import BaseModel
 
 class GateConfig(BaseModel):
     """Policy as Code for model hierarchy."""
-    executor_model: str = "deepseek/deepseek-v4-pro"
+    executor_model: str = "deepseek/deepseek-chat"
     verifier_model: str = "deepseek/deepseek-chat"
     planner_model: str = "deepseek/deepseek-chat"
-    cheap_model: str = "deepseek/deepseek-v4-pro"
+    cheap_model: str = "deepseek/deepseek-chat"
     strong_planner_model: str = "deepseek/deepseek-chat"
     strong_verifier_model: str = "deepseek/deepseek-chat"
     model_policy: Literal["policy_ladder", "best_always", "cost_first"] = "policy_ladder"
