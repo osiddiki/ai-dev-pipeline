@@ -11,7 +11,7 @@ class LLMClient:
     """Wrapper for LLM interactions via LiteLLM supporting multiple providers."""
 
     @classmethod
-    async def chat(cls, model_id: str, messages: list[dict], temperature: float = 0.3, response_format=None):
+    async def chat(cls, model_id: str, messages: list[dict], temperature: float = 0.3, response_format=None, tools=None):
         """
         Generic chat method. 
         model_id examples:
@@ -30,9 +30,22 @@ class LLMClient:
             }
             if response_format:
                 kwargs["response_format"] = response_format
+            if tools:
+                kwargs["tools"] = tools
                 
             response = await acompletion(**kwargs)
-            content = response.choices[0].message.content
+            
+            # If the model returns tool calls, we return the raw message object so the caller can process them
+            message = response.choices[0].message
+            if getattr(message, "tool_calls", None):
+                usage = response.usage
+                metrics = {
+                    "prompt_tokens": usage.prompt_tokens if usage else 0,
+                    "completion_tokens": usage.completion_tokens if usage else 0
+                }
+                return message, metrics
+
+            content = message.content
             usage = response.usage
             metrics = {
                 "prompt_tokens": usage.prompt_tokens if usage else 0,

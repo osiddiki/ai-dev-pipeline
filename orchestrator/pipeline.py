@@ -221,17 +221,8 @@ class ReleaseArcOrchestrator:
             return False
 
     async def gather_context(self, repo_path: Path) -> str:
-        sandbox = DockerSandbox(str(repo_path))
-        structure_out, _ = await asyncio.to_thread(
-            sandbox.execute_command,
-            "find . -maxdepth 3 -not -path '*/.*' -not -path './node_modules/*' 2>/dev/null | head -n 250",
-        )
-        docs = []
-        for doc in ("AGENTS.md", "README.md", "package.json"):
-            content = sandbox.read_file(doc)
-            if "[File does not exist]" not in content:
-                docs.append(f"--- {doc} ---\n{content[:2000]}")
-        return f"STRUCTURE:\n{structure_out}\n\nDOCS:\n" + "\n".join(docs)
+        # Context is now dynamically gathered by agent tools
+        return f"Base repository path: {repo_path}"
 
     async def _execute_task(
         self,
