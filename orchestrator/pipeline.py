@@ -19,7 +19,7 @@ from agents.models import GateConfig, VerificationResult
 from agents.researcher import ResearcherAgent
 from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
 from agents.worker import WorkerResult
-from environment.sandbox import DockerSandbox
+from environment.mcp_client import PipelineMCPClient
 from ledger.database import get_db
 from orchestrator.self_improvement import (
     CircuitBreaker,
@@ -190,8 +190,11 @@ class ReleaseArcOrchestrator:
             release_files = self._changed_files_between(work_repo, base_sha, "HEAD")
             if release_files:
                 GateUI.step("verify", "Running final release verification.")
-                final_verifier = VerifierEngine(DockerSandbox(str(work_repo)), planner_model=self.config.planner_model)
+                sandbox = PipelineMCPClient(str(work_repo))
+                await sandbox.connect()
+                final_verifier = VerifierEngine(sandbox, planner_model=self.config.planner_model)
                 final_result = await final_verifier.verify_release(repo_context, release_files)
+                await sandbox.disconnect()
                 await self._record_verification(db, arc_id, None, final_result, 1, release_files)
                 if not final_result.success:
                     GateUI.error("Final release verification failed.", final_result.reason)
@@ -270,7 +273,7 @@ class ReleaseArcOrchestrator:
                 "feedback": feedback,
                 "repair_brief": repair_brief,
                 "active_rules": active_rules_text,
-                "sandbox": DockerSandbox(str(work_repo)),
+                "sandbox": PipelineMCPClient(str(work_repo)),
             }
             prompt = self.worker.build_prompt(worker_context, task)
             prompt_digest = prompt_hash(prompt)
@@ -435,13 +438,16 @@ class ReleaseArcOrchestrator:
                     GateUI.warning(feedback)
                     continue
 
-            verifier = VerifierEngine(DockerSandbox(str(work_repo)), planner_model=self.config.planner_model)
+            sandbox = PipelineMCPClient(str(work_repo))
+            await sandbox.connect()
+            verifier = VerifierEngine(sandbox, planner_model=self.config.planner_model)
             verification = await verifier.verify(
                 task_description=task.description,
                 repo_context=repo_context,
                 changed_files=changed_files,
                 acceptance_criteria=task.acceptance_criteria,
             )
+            await sandbox.disconnect()
             await self._record_verification(db, arc_id, task.id, verification, attempt, changed_files)
             if not verification.success:
                 analysis = await self._handle_failed_attempt(
@@ -1094,8 +1100,10 @@ class ReleaseArcOrchestrator:
                 continue
             rel_dir = str(package_dir.relative_to(work_repo))
             GateUI.step("deps", f"Installing dependencies in {rel_dir}.")
-            sandbox = DockerSandbox(str(work_repo))
-            output, code = sandbox.execute_command(f"cd {shlex.quote(rel_dir)} && npm install")
+            sandbox = PipelineMCPClient(str(work_repo))
+            await sandbox.connect()
+            output, code = await sandbox.execute_command(f"cd {shlex.quote(rel_dir)} && npm install")
+            await sandbox.disconnect()
             if code != 0:
                 return f"Dependency install failed in {rel_dir}: {output[:1200]}"
         return None

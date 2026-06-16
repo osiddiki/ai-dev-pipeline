@@ -8,7 +8,7 @@ from typing import List, Optional, Set
 import structlog
 
 from agents.models import VerificationResult
-from environment.sandbox import DockerSandbox
+from environment.mcp_client import PipelineMCPClient
 
 logger = structlog.get_logger()
 
@@ -16,7 +16,7 @@ logger = structlog.get_logger()
 class VerifierEngine:
     """Deterministic verifier for GATE task acceptance."""
 
-    def __init__(self, sandbox: DockerSandbox, planner_model: str = "gemini/gemini-2.5-pro"):
+    def __init__(self, sandbox: PipelineMCPClient, planner_model: str = "gemini/gemini-2.5-pro"):
         self.sandbox = sandbox
         self.repo_root = Path(self.sandbox.target_repo_path).resolve()
 
@@ -79,7 +79,7 @@ class VerifierEngine:
         missing = []
         for rel_path in changed_files:
             quoted = shlex.quote(rel_path)
-            output, _ = await asyncio.to_thread(self.sandbox.execute_command, f"[ -f {quoted} ] && echo yes || echo no")
+            output, _ = await self.sandbox.execute_command(f"[ -f {quoted} ] && echo yes || echo no")
             if output.strip() != "yes":
                 missing.append(rel_path)
         return missing
@@ -141,7 +141,7 @@ class VerifierEngine:
                 if script not in scripts:
                     continue
                 cmd = f"cd {shlex.quote(rel_dir)} && npm run {script} --if-present"
-                output, code = await asyncio.to_thread(self.sandbox.execute_command, cmd)
+                output, code = await self.sandbox.execute_command(cmd)
                 if code != 0:
                     return VerificationResult(
                         success=False,
@@ -156,21 +156,21 @@ class VerifierEngine:
     async def _check_json(self, rel_path: str) -> VerificationResult:
         script = "const fs=require('fs'); JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));"
         cmd = f"node -e {shlex.quote(script)} {shlex.quote(rel_path)}"
-        output, code = await asyncio.to_thread(self.sandbox.execute_command, cmd)
+        output, code = await self.sandbox.execute_command(cmd)
         if code != 0:
             return VerificationResult(success=False, reason=f"Invalid JSON in {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
         return VerificationResult(success=True, reason=f"JSON parsed: {rel_path}", evidence=cmd)
 
     async def _check_js(self, rel_path: str) -> VerificationResult:
         cmd = f"node --check {shlex.quote(rel_path)}"
-        output, code = await asyncio.to_thread(self.sandbox.execute_command, cmd)
+        output, code = await self.sandbox.execute_command(cmd)
         if code != 0:
             return VerificationResult(success=False, reason=f"JavaScript syntax failed for {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
         return VerificationResult(success=True, reason=f"JavaScript syntax passed: {rel_path}", evidence=cmd)
 
     async def _check_ts_file(self, rel_path: str) -> VerificationResult:
         cmd = f"npx tsc --noEmit --skipLibCheck --target esnext --module commonjs {shlex.quote(rel_path)}"
-        output, code = await asyncio.to_thread(self.sandbox.execute_command, cmd)
+        output, code = await self.sandbox.execute_command(cmd)
         if code != 0:
             return VerificationResult(success=False, reason=f"TypeScript check failed for {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
         return VerificationResult(success=True, reason=f"TypeScript check passed: {rel_path}", evidence=cmd)
@@ -178,7 +178,7 @@ class VerifierEngine:
     async def _check_ts_project(self, project_dir: Path) -> VerificationResult:
         rel_dir = self._rel(project_dir)
         cmd = f"cd {shlex.quote(rel_dir)} && npx tsc --noEmit -p tsconfig.json"
-        output, code = await asyncio.to_thread(self.sandbox.execute_command, cmd)
+        output, code = await self.sandbox.execute_command(cmd)
         if code != 0:
             return VerificationResult(success=False, reason=f"TypeScript project check failed in {rel_dir}: {output[:800]}", used_command=cmd, evidence=output)
         return VerificationResult(success=True, reason=f"TypeScript project check passed in {rel_dir}", evidence=cmd)

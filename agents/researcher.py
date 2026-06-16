@@ -3,7 +3,7 @@ import asyncio
 from .base import BaseAgent, AgentResult
 from .prompts import RESEARCHER_PROMPT
 from integrations.gemini_client import LLMClient
-from environment.sandbox import DockerSandbox
+from environment.mcp_client import PipelineMCPClient
 import structlog
 
 logger = structlog.get_logger()
@@ -20,13 +20,15 @@ class ResearcherAgent(BaseAgent):
         
         repo_path = context.get("repo_path", ".")
         repo_context = context.get("repo_context", "")
-        sandbox = DockerSandbox(repo_path)
+        sandbox = PipelineMCPClient(repo_path)
+        await sandbox.connect()
         
         # 1. Step 1: Broad Search
         # We run a multi-keyword grep to find likely candidates
         keywords = task_description.split()
         search_terms = "|".join([k for k in keywords if len(k) > 4][:5]) # Top 5 long words
-        grep_results, _ = await asyncio.to_thread(sandbox.execute_command, f"grep -rEi '{search_terms}' . --exclude-dir={{.git,node_modules,dist,build}} | head -n 30")
+        grep_results, _ = await sandbox.execute_command(f"grep -rEi '{search_terms}' . --exclude-dir={{.git,node_modules,dist,build}} | head -n 30")
+        await sandbox.disconnect()
         
         # 2. Step 2: Agentic Synthesis
         # We ask the LLM to analyze the task and the grep results to build the report

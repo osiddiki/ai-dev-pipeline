@@ -11,3 +11,4 @@ httpx>=0.24.0
 aiosqlite
 PyYAML
 aider-chat>=0.70.0
+mcp>=1.1.2
