@@ -68,6 +68,7 @@ class CodebaseRAG:
                 continue
 
         batch_size = 50
+        chunks_processed = 0
         for i in range(0, len(docs), batch_size):
             try:
                 self.collection.upsert(
@@ -75,8 +76,14 @@ class CodebaseRAG:
                     ids=ids[i:i+batch_size],
                     metadatas=metadatas[i:i+batch_size]
                 )
+                chunks_processed += batch_size
                 import time
-                time.sleep(2) # Respect Gemini API rate limits (15 RPM)
+                if chunks_processed >= 500:
+                    logger.info("TPM limit approaching, sleeping 60 seconds to reset quota...")
+                    time.sleep(60)
+                    chunks_processed = 0
+                else:
+                    time.sleep(2) # Respect Gemini API rate limits (15 RPM)
             except Exception as e:
                 if "429" not in str(e) and "RESOURCE_EXHAUSTED" not in str(e):
                     logger.error("RAG upsert batch failed", error=str(e))
