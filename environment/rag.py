@@ -78,9 +78,10 @@ class CodebaseRAG:
                 import time
                 time.sleep(2) # Respect Gemini API rate limits (15 RPM)
             except Exception as e:
-                logger.error("RAG upsert batch failed", error=str(e))
+                if "429" not in str(e) and "RESOURCE_EXHAUSTED" not in str(e):
+                    logger.error("RAG upsert batch failed", error=str(e))
                 import time
-                time.sleep(10) # Backoff on failure
+                time.sleep(1) # Backoff on failure
                 
         logger.info("RAG index built", total_chunks=len(docs))
 
