@@ -41,14 +41,11 @@ class CodebaseRAG:
         return files
 
     def build_index(self):
+        logger.info("Semantic RAG disabled by user to conserve API budget. Falling back to Keyword Search.")
+        return
+        
         logger.info("Building RAG index...")
         files = self._get_files()
-        
-        docs = []
-        ids = []
-        metadatas = []
-        
-        for f in files:
             try:
                 content = f.read_text(encoding="utf-8")
                 lines = content.split('\n')
