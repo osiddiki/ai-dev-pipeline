@@ -20,7 +20,7 @@ class AiderWorkerAgent(BaseAgent):
 
     name = "aider_worker"
 
-    def __init__(self, model_id: str = "gemini/gemini-2.5-pro"):
+    def __init__(self, model_id: str = "deepseek/deepseek-chat"):
         super().__init__(model_id=model_id)
 
     async def invoke(

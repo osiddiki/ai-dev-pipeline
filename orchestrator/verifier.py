@@ -58,9 +58,34 @@ class TypeScriptValidator(FileValidator):
 class VerifierEngine:
     """Deterministic verifier for GATE task acceptance."""
 
-    def __init__(self, sandbox: PipelineMCPClient, planner_model: str = "gemini/gemini-2.5-pro"):
+    def __init__(self, sandbox: PipelineMCPClient, planner_model: str = "deepseek/deepseek-chat"):
         self.sandbox = sandbox
         self.repo_root = Path(self.sandbox.target_repo_path).resolve()
+
+    def _detect_docker_image(self) -> str:
+        if (self.repo_root / "package.json").exists():
+            return "node:20-alpine"
+        return "python:3.10-slim"
+
+    async def _run_in_docker(self, cmd: str, rel_dir: str = "") -> tuple[str, int]:
+        import docker
+        client = docker.from_env()
+        image = self._detect_docker_image()
+        target_dir = f"/workspace/{rel_dir}" if rel_dir else "/workspace"
+        try:
+            container = client.containers.run(
+                image,
+                command=["sh", "-c", cmd],
+                volumes={str(self.repo_root): {'bind': '/workspace', 'mode': 'rw'}},
+                working_dir=target_dir,
+                detach=True
+            )
+            result = container.wait(timeout=120)
+            logs = container.logs().decode("utf-8", errors="replace")
+            container.remove(force=True)
+            return logs, result['StatusCode']
+        except Exception as e:
+            return f"Docker execution error: {str(e)}", 1
 
     async def verify(
         self,
@@ -188,8 +213,8 @@ class VerifierEngine:
             for script in ("lint", "test", "build"):
                 if script not in scripts:
                     continue
-                cmd = f"cd {shlex.quote(rel_dir)} && npm run {script} --if-present"
-                output, code = await self.sandbox.execute_command(cmd)
+                cmd = f"npm run {script} --if-present"
+                output, code = await self._run_in_docker(cmd, rel_dir)
                 if code != 0:
                     return VerificationResult(
                         success=False,
@@ -200,8 +225,8 @@ class VerifierEngine:
                 evidence.append(f"{cmd}\n{output[:1000]}")
 
         if (self.repo_root / "tests").exists() or (self.repo_root / "pytest.ini").exists():
-            cmd = "pytest"
-            output, code = await self.sandbox.execute_command(cmd)
+            cmd = "pip install pytest && pytest"
+            output, code = await self._run_in_docker(cmd)
             if code not in (0, 5):
                 return VerificationResult(
                     success=False,

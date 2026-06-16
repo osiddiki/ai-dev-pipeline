@@ -1,7 +1,7 @@
 import structlog
 from typing import Any
 from .base import BaseAgent, AgentResult
-from .worker import AiderWorkerAgent
+from .aider_worker import AiderWorkerAgent
 from .prompts import TEST_WRITER_PROMPT
 
 logger = structlog.get_logger()

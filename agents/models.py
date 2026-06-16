@@ -4,11 +4,11 @@ from pydantic import BaseModel
 class GateConfig(BaseModel):
     """Policy as Code for model hierarchy."""
     executor_model: str = "deepseek/deepseek-v4-pro"
-    verifier_model: str = "gemini/gemini-3.1-pro-preview"
-    planner_model: str = "gemini/gemini-2.5-pro"
+    verifier_model: str = "deepseek/deepseek-chat"
+    planner_model: str = "deepseek/deepseek-chat"
     cheap_model: str = "deepseek/deepseek-v4-pro"
-    strong_planner_model: str = "gemini/gemini-2.5-pro"
-    strong_verifier_model: str = "gemini/gemini-3.1-pro-preview"
+    strong_planner_model: str = "deepseek/deepseek-chat"
+    strong_verifier_model: str = "deepseek/deepseek-chat"
     model_policy: Literal["policy_ladder", "best_always", "cost_first"] = "policy_ladder"
     rule_mode: Literal["review_first", "auto_apply", "local_only"] = "review_first"
     max_plan_repairs: int = 2

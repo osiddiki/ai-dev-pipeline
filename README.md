@@ -6,19 +6,21 @@ GATE (Gate Analysis & Trust Engineering) is an autonomous, agentic release contr
 
 The pipeline consists of specialized agents operating in an orchestration loop:
 
-1. **Supervisor Agent**: Uses RAG (Retrieval-Augmented Generation) and MCP tools to explore the codebase and decompose a given issue into a JSON array of strict atomic tasks.
-2. **Test Writer Agent**: A specialized TDD (Test-Driven Development) agent that reads the task and writes failing unit tests for the expected behavior using Aider.
-3. **Aider Worker Agent**: Implements the actual feature/bugfix code natively using the Aider CLI inside an isolated git worktree, aiming to pass the newly written tests.
-4. **Deterministic Verifier**: Automatically executes project-native validation commands (`npm run test`, `pytest`, `python -m py_compile`) via a local bash MCP server to ensure code correctness.
-5. **Gatekeeper Agent**: Acts as a senior architectural reviewer. It runs in a dynamic 10-step ReAct tool loop, exploring the codebase to ensure the worker's diff did not break any surrounding dependencies.
+1. **Supervisor Agent**: Uses RAG, AST-search (`grep-ast`), and MCP tools to explore the codebase and decompose a given issue into a strict JSON array of tasks (with robust multi-model markdown parsing).
+2. **Test Writer Agent**: A specialized TDD agent that reads the task and writes failing unit tests.
+3. **Aider Worker Agent**: Implements the actual feature code natively using the Aider CLI. 
+   - **Parallel Worktrees**: Operates in fully isolated, parallel git worktrees via `asyncio.gather` for simultaneous task execution.
+4. **Deterministic Verifier**: Automatically executes project-native validation commands inside **isolated Docker containers** mapped directly to the active worktree.
+5. **Gatekeeper Agent**: Acts as a senior architectural reviewer in a dynamic ReAct tool loop.
 6. **Self-Improvement Layer**: Extracts historical failures, rewrites prompts, routes models, and proposes durable engineering rules.
-7. **Ledger**: Maintains an SQLite audit trail of all task attempts, gates, and verification results.
+7. **Ledger**: Maintains an SQLite audit trail.
 
 ## Requirements
 
 - Python 3.10+
 - `aider-chat` installed globally
-- API keys for models configured in `.env` (e.g. `GEMINI_API_KEY`, `OPENAI_API_KEY`)
+- Docker (for dynamic verifier containers)
+- API keys for models configured in `.env` (Defaults to DeepSeek via `DEEPSEEK_API_KEY`)
 
 Install Python dependencies:
 

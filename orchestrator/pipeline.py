@@ -18,7 +18,7 @@ from agents.meta_analyzer import MetaAnalyzerAgent
 from agents.models import GateConfig, VerificationResult
 from agents.researcher import ResearcherAgent
 from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
-from agents.worker import WorkerAgent, WorkerResult
+from agents.worker import WorkerResult
 from agents.test_writer import TestWriterAgent
 from environment.mcp_client import PipelineMCPClient
 from ledger.database import get_db
@@ -159,35 +159,69 @@ class ReleaseArcOrchestrator:
 
             await self._persist_tasks(db, arc_id, plan)
 
-            index = 0
-            while index < len(plan.tasks):
-                task = plan.tasks[index]
-                GateUI.header(f"TASK {index + 1}/{len(plan.tasks)}: {task.id}")
+            independent = all(not task.dependencies for task in plan.tasks)
+            
+            if independent and len(plan.tasks) > 1:
+                GateUI.step("parallel", f"Executing {len(plan.tasks)} independent tasks in parallel")
+                import shutil
+                task_repos = []
+                for task in plan.tasks:
+                    task_repo = work_repo.parent / f"{work_repo.name}_{task.id}"
+                    if not task_repo.exists():
+                        subprocess.run(["git", "worktree", "add", "-b", f"gate_{arc_id}_{task.id}", str(task_repo), "HEAD"], cwd=str(work_repo), check=True)
+                    task_repos.append(task_repo)
 
-                if await self._task_is_current(db, arc_id, task, work_repo):
-                    GateUI.success("Task checkpoint is already current; skipping.")
+                coroutines = []
+                for idx, task in enumerate(plan.tasks):
+                    coroutines.append(
+                        self._execute_task(
+                            db=db, arc_id=arc_id, issue_id=issue_id, issue_description=issue_description,
+                            repo_context=repo_context, discovery_report=discovery_report, plan=plan, task=task,
+                            work_repo=task_repos[idx], all_diffs=all_diffs, active_rules=active_rules, active_rules_text=active_rules_text
+                        )
+                    )
+                
+                results = await asyncio.gather(*coroutines, return_exceptions=True)
+                
+                for idx, result in enumerate(results):
+                    if isinstance(result, Exception) or not result[0]:
+                        GateUI.error(f"Task {plan.tasks[idx].id} failed during parallel execution.")
+                        await self._fail_arc(db, arc_id)
+                        return False
+                
+                for task in plan.tasks:
+                    subprocess.run(["git", "merge", f"gate_{arc_id}_{task.id}", "--no-edit"], cwd=str(work_repo), check=False)
+                    
+            else:
+                index = 0
+                while index < len(plan.tasks):
+                    task = plan.tasks[index]
+                    GateUI.header(f"TASK {index + 1}/{len(plan.tasks)}: {task.id}")
+
+                    if await self._task_is_current(db, arc_id, task, work_repo):
+                        GateUI.success("Task checkpoint is already current; skipping.")
+                        index += 1
+                        continue
+
+                    success, plan = await self._execute_task(
+                        db=db,
+                        arc_id=arc_id,
+                        issue_id=issue_id,
+                        issue_description=issue_description,
+                        repo_context=repo_context,
+                        discovery_report=discovery_report,
+                        plan=plan,
+                        task=task,
+                        work_repo=work_repo,
+                        all_diffs=all_diffs,
+                        active_rules=active_rules,
+                        active_rules_text=active_rules_text,
+                    )
+                    if not success:
+                        await self._fail_arc(db, arc_id)
+                        return False
+                    await self._persist_tasks(db, arc_id, plan)
                     index += 1
-                    continue
-
-                success, plan = await self._execute_task(
-                    db=db,
-                    arc_id=arc_id,
-                    issue_id=issue_id,
-                    issue_description=issue_description,
-                    repo_context=repo_context,
-                    discovery_report=discovery_report,
-                    plan=plan,
-                    task=task,
-                    work_repo=work_repo,
-                    all_diffs=all_diffs,
-                    active_rules=active_rules,
-                    active_rules_text=active_rules_text,
-                )
-                if not success:
-                    await self._fail_arc(db, arc_id)
-                    return False
-                await self._persist_tasks(db, arc_id, plan)
-                index += 1
 
             release_files = self._changed_files_between(work_repo, base_sha, "HEAD")
             if release_files:
@@ -290,8 +324,11 @@ class ReleaseArcOrchestrator:
                 route.reason,
             )
             
-            GateUI.step("tdd", "Invoking Test Writer Agent")
-            test_result = await self.test_writer.invoke(worker_context, task)
+            if getattr(task, "requires_tests", True):
+                GateUI.step("tdd", "Invoking Test Writer Agent")
+                test_result = await self.test_writer.invoke(worker_context, task)
+            else:
+                GateUI.step("tdd", "Skipping Test Writer Agent (requires_tests=False)")
 
             GateUI.step("execute", "Invoking Worker Agent")
             worker_result = await self.worker.invoke(
@@ -386,7 +423,7 @@ class ReleaseArcOrchestrator:
                 continue
 
             if self.config.allow_dependency_install:
-                bootstrap_error = self._bootstrap_dependencies(work_repo, changed_files)
+                bootstrap_error = await self._bootstrap_dependencies(work_repo, changed_files)
                 if bootstrap_error:
                     analysis = await self._handle_failed_attempt(
                         db=db,
@@ -1088,7 +1125,7 @@ class ReleaseArcOrchestrator:
         self._run(["git", "reset", "--hard", "HEAD"], work_repo)
         self._run(["git", "clean", "-fd"], work_repo)
 
-    def _bootstrap_dependencies(self, work_repo: Path, changed_files: List[str]) -> Optional[str]:
+    async def _bootstrap_dependencies(self, work_repo: Path, changed_files: List[str]) -> Optional[str]:
         package_dirs = []
         for rel_path in changed_files:
             path = work_repo / rel_path

@@ -97,7 +97,15 @@ class GatekeeperAgent(BaseAgent):
 
         system_prompt = f"{GATEKEEPER_SYSTEM_PROMPT}\nYou may use tools to explore the codebase. Once you have enough context, output ONLY a valid JSON object matching the GateReviewReport schema to render your verdict."
         
-        all_diffs_text = "\n".join([f"Task {d.task_id} Diff:\n{d.diff}" for d in diffs])
+        # Context Pruning: Truncate diffs if they are extremely large to save tokens
+        pruned_diffs = []
+        for d in diffs:
+            diff_text = d.diff
+            if len(diff_text) > 20000:
+                diff_text = diff_text[:20000] + "\n...[TRUNCATED FOR CONTEXT PRUNING]..."
+            pruned_diffs.append(f"Task {d.task_id} Diff:\n{diff_text}")
+            
+        all_diffs_text = "\n".join(pruned_diffs)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Original Requirement: {issue}\nActive learned rules:\n{active_rules or 'None'}\nComplete Implementation:\n{all_diffs_text}"}

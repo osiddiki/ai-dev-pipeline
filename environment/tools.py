@@ -53,6 +53,23 @@ class CodebaseTools:
         except Exception as e:
             return f"Error searching: {str(e)}"
 
+    def ast_search(self, query: str, path: str = ".") -> str:
+        try:
+            target = self._resolve_path(path)
+            result = subprocess.run(
+                ["grep-ast", query, str(target)],
+                text=True,
+                capture_output=True
+            )
+            out = result.stdout.strip()
+            if not out:
+                return f"No AST results found for '{query}' in {path}"
+            if len(out) > 10000:
+                out = out[:10000] + "\n... [TRUNCATED]"
+            return out
+        except Exception as e:
+            return f"Error running grep-ast: {str(e)}"
+
     def semantic_code_search(self, query: str) -> str:
         """Perform a semantic vector search across the entire codebase."""
         return self.rag.search(query)
@@ -66,6 +83,10 @@ class CodebaseTools:
             return self.search_codebase(arguments.get("query", ""), arguments.get("path", "."))
         elif tool_name == "semantic_code_search":
             return self.semantic_code_search(arguments.get("query", ""))
+        elif tool_name == "find_class_definition":
+            return self.ast_search(f"class {arguments.get('class_name', '')}", arguments.get("path", "."))
+        elif tool_name == "find_function_references":
+            return self.ast_search(arguments.get("function_name", ""), arguments.get("path", "."))
         else:
             return f"Error: Unknown tool '{tool_name}'"
 
@@ -123,6 +144,36 @@ CODEBASE_TOOLS_SCHEMA = [
                     "query": {"type": "string", "description": "A natural language query (e.g., 'Where is the database connection established?')."}
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_class_definition",
+            "description": "Find the definition of a class and its exact context using AST parsing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "class_name": {"type": "string", "description": "The name of the class to find."},
+                    "path": {"type": "string", "description": "Relative path to limit the search (defaults to '.')."}
+                },
+                "required": ["class_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_function_references",
+            "description": "Find a function and its usages with full structural context using AST parsing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "function_name": {"type": "string", "description": "The name of the function to find."},
+                    "path": {"type": "string", "description": "Relative path to limit the search (defaults to '.')."}
+                },
+                "required": ["function_name"]
             }
         }
     }

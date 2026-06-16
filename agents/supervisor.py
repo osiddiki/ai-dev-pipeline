@@ -16,6 +16,7 @@ class TaskDefinition(BaseModel):
     dependencies: List[str] = Field(default_factory=list)
     design_constraints: str = "Follow project guidelines."
     acceptance_criteria: str = "Code compiles and passes linting."
+    requires_tests: bool = True
 
     @property
     def allowed_files(self) -> List[str]:
@@ -49,14 +50,8 @@ Project guidelines: {guidelines}
 
 Explore the codebase carefully. When you have gathered enough information, output your final plan in JSON format.
 Your final response must be ONLY a valid JSON array of tasks matching this schema:
-[{{
-  "id": "task-1",
-  "description": "...",
-  "target_files": ["src/app.py"],
-  "dependencies": [],
-  "design_constraints": "...",
-  "acceptance_criteria": "..."
-}}]
+[{{ "id": "task-1", "description": "...", "target_files": ["src/app.py"], "dependencies": [], "design_constraints": "...", "acceptance_criteria": "...", "requires_tests": true }}]
+You can set "requires_tests": false for tasks involving static content, basic CSS/UI updates, or simple documentation.
 """
         
         messages = [
@@ -95,7 +90,11 @@ Your final response must be ONLY a valid JSON array of tasks matching this schem
             
             raw_response = response
             try:
-                clean_json = raw_response.strip().replace("```json", "").replace("```", "").strip()
+                clean_json = raw_response.strip()
+                if '[' in clean_json and ']' in clean_json:
+                    clean_json = clean_json[clean_json.find('['):clean_json.rfind(']')+1]
+                else:
+                    clean_json = clean_json.replace("```json", "").replace("```", "").strip()
                 plan_data = json.loads(clean_json)
                 plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])
                 return AgentResult(success=True, output=plan)
@@ -152,7 +151,11 @@ Output your final revised plan as a JSON array.
             
             raw_response = response
             try:
-                clean_json = raw_response.strip().replace("```json", "").replace("```", "").strip()
+                clean_json = raw_response.strip()
+                if '[' in clean_json and ']' in clean_json:
+                    clean_json = clean_json[clean_json.find('['):clean_json.rfind(']')+1]
+                else:
+                    clean_json = clean_json.replace("```json", "").replace("```", "").strip()
                 plan_data = json.loads(clean_json)
                 revised_plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])
                 return AgentResult(success=True, output=revised_plan)

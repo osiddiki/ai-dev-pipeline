@@ -26,7 +26,13 @@ class LLMClient:
                 "model": model_id,
                 "messages": messages,
                 "temperature": temperature,
-                "max_tokens": 8192
+                "max_tokens": 8192,
+                "safety_settings": [
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                ]
             }
             if response_format:
                 kwargs["response_format"] = response_format
@@ -35,6 +41,9 @@ class LLMClient:
                 
             response = await acompletion(**kwargs)
             
+            if not response.choices:
+                raise ValueError(f"LLM API returned an empty response. This is likely due to a content filter. Raw response: {response}")
+
             # If the model returns tool calls, we return the raw message object so the caller can process them
             message = response.choices[0].message
             if getattr(message, "tool_calls", None):
