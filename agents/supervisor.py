@@ -107,8 +107,17 @@ You can set "requires_tests": false for tasks involving static content, basic CS
                             clean_json = clean_json[:end]
                             
                 clean_json = clean_json.strip()
-                if '[' in clean_json and ']' in clean_json:
-                    clean_json = clean_json[clean_json.find('['):clean_json.rfind(']')+1]
+                start_idx = clean_json.find('[')
+                if start_idx != -1:
+                    count = 0
+                    for i in range(start_idx, len(clean_json)):
+                        if clean_json[i] == '[':
+                            count += 1
+                        elif clean_json[i] == ']':
+                            count -= 1
+                        if count == 0:
+                            clean_json = clean_json[start_idx:i+1]
+                            break
 
                 plan_data = json.loads(clean_json)
                 plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])
@@ -182,8 +191,17 @@ Output your final revised plan as a JSON array.
                             clean_json = clean_json[:end]
                             
                 clean_json = clean_json.strip()
-                if '[' in clean_json and ']' in clean_json:
-                    clean_json = clean_json[clean_json.find('['):clean_json.rfind(']')+1]
+                start_idx = clean_json.find('[')
+                if start_idx != -1:
+                    count = 0
+                    for i in range(start_idx, len(clean_json)):
+                        if clean_json[i] == '[':
+                            count += 1
+                        elif clean_json[i] == ']':
+                            count -= 1
+                        if count == 0:
+                            clean_json = clean_json[start_idx:i+1]
+                            break
 
                 plan_data = json.loads(clean_json)
                 revised_plan = SupervisorPlan(tasks=[TaskDefinition(**t) for t in plan_data])

@@ -39,7 +39,7 @@ class LLMClient:
                 schema_str = response_format.schema_json() if hasattr(response_format, "schema_json") else str(response_format)
                 messages.append({
                     "role": "user",
-                    "content": f"Please format your output strictly as a JSON object matching this schema:\n{schema_str}\nDo not include any conversational text."
+                    "content": f"Please format your output strictly as a JSON object matching this schema:\n{schema_str}\nYou MUST wrap your entire response inside a ```json and ``` markdown block. Do not include any conversational text."
                 })
             if tools:
                 kwargs["tools"] = tools

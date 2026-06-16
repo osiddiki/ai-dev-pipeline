@@ -42,6 +42,8 @@ class GatekeeperAgent(BaseAgent):
         """Extract data from the Gatekeeper's structured JSON response."""
         try:
             clean_json = raw_response.strip()
+            
+            # 1. Try markdown extraction
             start = clean_json.find("```json")
             if start != -1:
                 clean_json = clean_json[start+7:]
@@ -56,9 +58,19 @@ class GatekeeperAgent(BaseAgent):
                     if end != -1:
                         clean_json = clean_json[:end]
                         
+            # 2. Balanced brace extraction (bulletproof)
             clean_json = clean_json.strip()
-            if '{' in clean_json and '}' in clean_json:
-                clean_json = clean_json[clean_json.find('{'):clean_json.rfind('}')+1]
+            start_idx = clean_json.find('{')
+            if start_idx != -1:
+                count = 0
+                for i in range(start_idx, len(clean_json)):
+                    if clean_json[i] == '{':
+                        count += 1
+                    elif clean_json[i] == '}':
+                        count -= 1
+                    if count == 0:
+                        clean_json = clean_json[start_idx:i+1]
+                        break
 
             report_data = json.loads(clean_json)
             report = GateReviewReport(**report_data)
