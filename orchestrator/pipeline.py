@@ -18,7 +18,8 @@ from agents.meta_analyzer import MetaAnalyzerAgent
 from agents.models import GateConfig, VerificationResult
 from agents.researcher import ResearcherAgent
 from agents.supervisor import SupervisorAgent, SupervisorPlan, TaskDefinition
-from agents.worker import WorkerResult
+from agents.worker import WorkerAgent, WorkerResult
+from agents.test_writer import TestWriterAgent
 from environment.mcp_client import PipelineMCPClient
 from ledger.database import get_db
 from orchestrator.self_improvement import (
@@ -95,6 +96,7 @@ class ReleaseArcOrchestrator:
 
         self.gatekeeper = GatekeeperAgent(model_id=self.config.verifier_model)
         self.researcher = ResearcherAgent(model_id=self.config.planner_model)
+        self.test_writer = TestWriterAgent(model_id=self.config.executor_model)
         self.meta_analyzer = MetaAnalyzerAgent(model_id=self.config.planner_model)
         self.failure_analyzer = FailureAnalyzer()
         self.prompt_rewriter = PromptRewriter()
@@ -287,6 +289,11 @@ class ReleaseArcOrchestrator:
                 [rule.id for rule in active_rules],
                 route.reason,
             )
+            
+            GateUI.step("tdd", "Invoking Test Writer Agent")
+            test_result = await self.test_writer.invoke(worker_context, task)
+
+            GateUI.step("execute", "Invoking Worker Agent")
             worker_result = await self.worker.invoke(
                 worker_context,
                 task,

@@ -1,37 +1,24 @@
 # GATE AI Development Pipeline
 
-GATE (Gate Analysis & Trust Engineering) is an autonomous release controller for software engineering tasks. The current architecture uses Codex as the implementation worker and keeps GATE responsible for planning, policy, verification, audit history, and exact git checkpoints.
+GATE (Gate Analysis & Trust Engineering) is an autonomous, agentic release controller for software engineering tasks. It manages a team of AI agents that plan, test, implement, and review code in an isolated git worktree before proposing it for merge.
 
 ## Architecture
 
-```text
-Supervisor -> reviewed implementation plan
-Codex Worker -> direct file edits in an isolated git worktree
-Deterministic Verifier -> schema, syntax, type, build, lint, and test checks
-Gatekeeper -> adversarial model review of the verified diff
-Self-Improvement Layer -> failure classification, repair prompts, plan repair, model routing, rule proposals
-Ledger -> task, gate, verification, and commit audit trail
-```
+The pipeline consists of specialized agents operating in an orchestration loop:
 
-## What Changed
-
-- The Worker no longer emits fragile SEARCH/REPLACE patches.
-- Codex edits files directly through `codex exec`.
-- Each release arc runs in an isolated git worktree by default.
-- GATE rejects unexpected files, temp artifacts, prose-as-code, invalid JSON, failed TypeScript checks, and failed local project scripts.
-- Commits stage exact verified files only. The pipeline never uses `git add .`.
-- Dependency installation is controller-owned, not worker-owned, and happens only when enabled by config.
-- The ledger records gate reviews and deterministic verification results.
-- Failed attempts are classified into durable failure classes before retrying.
-- Repeated failures produce concise Codex repair briefs, bounded plan repairs, model-route escalation, or a deterministic stop.
-- Historical failures are mined into inactive rule proposals; approved rules are injected into future Supervisor, Codex, Gatekeeper, and verifier context.
+1. **Supervisor Agent**: Uses RAG (Retrieval-Augmented Generation) and MCP tools to explore the codebase and decompose a given issue into a JSON array of strict atomic tasks.
+2. **Test Writer Agent**: A specialized TDD (Test-Driven Development) agent that reads the task and writes failing unit tests for the expected behavior using Aider.
+3. **Aider Worker Agent**: Implements the actual feature/bugfix code natively using the Aider CLI inside an isolated git worktree, aiming to pass the newly written tests.
+4. **Deterministic Verifier**: Automatically executes project-native validation commands (`npm run test`, `pytest`, `python -m py_compile`) via a local bash MCP server to ensure code correctness.
+5. **Gatekeeper Agent**: Acts as a senior architectural reviewer. It runs in a dynamic 10-step ReAct tool loop, exploring the codebase to ensure the worker's diff did not break any surrounding dependencies.
+6. **Self-Improvement Layer**: Extracts historical failures, rewrites prompts, routes models, and proposes durable engineering rules.
+7. **Ledger**: Maintains an SQLite audit trail of all task attempts, gates, and verification results.
 
 ## Requirements
 
 - Python 3.10+
-- Docker Desktop
-- Codex CLI authenticated and available as `codex`
-- API keys for the planner/reviewer models configured in `.env`
+- `aider-chat` installed globally
+- API keys for models configured in `.env` (e.g. `GEMINI_API_KEY`, `OPENAI_API_KEY`)
 
 Install Python dependencies:
 
@@ -44,61 +31,25 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-PYTHONPATH=. .venv/bin/python orchestrator/pipeline.py
+python -m orchestrator.main --repo /path/to/repo --issue "Fix the auth bug"
 ```
 
-The pipeline will ask for:
-
-- target repository
-- issue id
-- task description, unless a plan file already contains the original requirement
-
-Plans and project policy live under:
-
-```text
-metadata/<project-name>/
-```
+The pipeline will automatically branch into a safe git worktree, plan the implementation, and begin executing the agent loop.
 
 ## Configuration
 
 Project-specific policy can be stored in `metadata/<project-name>/gate.yml`.
 
-Runtime policy defaults live in `agents/models.py`:
-
-- `codex_command`: command used to run Codex CLI
-- `codex_sandbox`: Codex sandbox mode, default `workspace-write`
-- `use_git_worktree`: run each arc in an isolated worktree
-- `max_task_attempts`: retry budget per task
-- `allow_dependency_install`: allow GATE to run dependency installs in Docker
-- `model_policy`: `policy_ladder`, `best_always`, or `cost_first`
-- `rule_mode`: defaults to `review_first`, so learned rules are proposed but not activated
-- `max_plan_repairs`: bounded plan/allowlist repair budget per task
-- `max_prompt_rewrites`: bounded prompt repair budget per task
-- `cheap_model`, `strong_planner_model`, `strong_verifier_model`: model-routing ladder
+Runtime policy defaults live in `agents/models.py`.
 
 ## Trust Model
 
-Codex is trusted to attempt implementation. GATE is trusted to decide whether the implementation is acceptable.
+Aider is trusted to attempt implementation. GATE is trusted to decide whether the implementation is acceptable.
 
 The acceptance chain is:
-
-1. Codex edits files.
-2. GATE reads the git diff.
-3. GATE rejects files outside the task allowlist.
-4. GATE runs deterministic verification.
-5. Failed attempts are classified and routed to prompt repair, plan repair, model escalation, or a circuit breaker.
-6. Gatekeeper reviews the already-verified diff.
-7. GATE stages exact files and commits a checkpoint.
-
-## Learned Rules
-
-Approved durable rules can be stored in `metadata/<project-name>/rules.yml`:
-
-```yaml
-rules:
-  - id: json-parse-after-edit
-    scope: json
-    text: After editing JSON, parse the exact file before declaring the task complete.
-```
-
-The `rule_proposals` table stores mined rules as `proposed` by default. Set a proposal to `approved` to activate it for future arcs.
+1. Test Writer drafts failing tests.
+2. Aider edits source files to pass the tests.
+3. GATE runs deterministic verification (`pytest`, `npm test`).
+4. Failed attempts are classified and routed to prompt repair or model escalation.
+5. Gatekeeper agentically explores the codebase to review the verified diff.
+6. GATE stages exact files and commits a checkpoint.

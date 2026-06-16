@@ -1,108 +1,41 @@
-# GATE Pipeline Operational Guide
+# GATE Pipeline: Step-by-Step Guide
 
-## Running A Release Arc
+This guide outlines exactly how the modern GATE pipeline processes an issue, from initialization to the final merged commit.
 
-Start the orchestrator:
+## 1. Initialization & Isolation
+The pipeline begins when you execute:
+`python -m orchestrator.main --repo /path/to/repo --issue "Fix the auth bug"`
 
-```bash
-PYTHONPATH=. .venv/bin/python orchestrator/pipeline.py
-```
+The very first action GATE takes is to create a secure **Git Worktree**. This guarantees that all AI agent experiments and file modifications happen in complete isolation and will never disrupt your active branch.
 
-Provide the target repository, issue id, and task description when prompted. The orchestrator creates or resumes a release arc in `trust_ledger.db`.
+Simultaneously, the pipeline spins up background **MCP (Model Context Protocol) Servers**. These servers act as standard interfaces that give the agents the ability to read your filesystem, search files, and run terminal commands safely.
 
-By default, GATE creates an isolated git worktree under:
+## 2. Context Gathering & Planning (Supervisor Agent)
+Before writing any code, the **Supervisor Agent** wakes up to map out an implementation strategy. 
+It uses the `semantic_code_search` tool—powered by a local ChromaDB RAG (Retrieval-Augmented Generation) index—to instantly find the relevant files for the issue without relying on rigid grep matches.
 
-```text
-$GATE_WORKTREE_ROOT/gate-worktrees/
-```
+The Supervisor executes a dynamic ReAct (Reason + Act) loop, repeatedly calling tools like `read_file_content` to build context. Once satisfied, it decomposes the original issue into a strict JSON `SupervisorPlan` consisting of one or more atomic `TaskDefinitions`.
 
-If `GATE_WORKTREE_ROOT` is not set, the system uses the OS temp directory.
+## 3. Test-Driven Execution Loop (Per Task)
+For every single task in the Supervisor's plan, the pipeline runs a rigorous, multi-agent loop:
 
-## How A Task Completes
+### A. Test Generation (Test Writer Agent)
+The **Test Writer Agent** is invoked first. Primed with a strict prompt to only write validation logic, it uses the Aider CLI underneath to generate failing unit tests or integration tests targeting the expected behavior. It uses the native testing framework of your project (e.g., `pytest`, `npm run test`).
 
-For each task:
+### B. Implementation (Worker Agent)
+The **Worker Agent** (also powered by Aider) is then unleashed. It receives the task instructions and sees the newly written failing tests in the git worktree. It implements the necessary source code changes to make the tests pass.
 
-1. Supervisor provides an explicit file allowlist.
-2. Codex runs through `codex exec --sandbox workspace-write`.
-3. GATE checks the git diff.
-4. GATE rejects unexpected files and temp artifacts.
-5. GATE installs dependencies in Docker when enabled and needed.
-6. GATE runs deterministic validation.
-7. Failed attempts are classified as plan, prompt, model, scope, dependency, syntax/type, or environment failures.
-8. GATE either rewrites the Codex repair brief, repairs the pending plan/allowlist, escalates model routing, or trips a circuit breaker.
-9. Gatekeeper reviews the verified diff.
-10. GATE stages exact files and commits the task checkpoint.
+### C. Deterministic Verification (Verifier Engine)
+The **Verifier Engine** takes over to prove the code works. Unlike LLMs, this engine is strictly deterministic. It pipes commands over MCP to run `python -m py_compile`, `npm run build`, and natively executes `pytest` or `npm test`.
+If any of these commands fail, the exact terminal output is fed back to the Worker Agent, forcing it to self-correct and retry until the tests pass.
 
-## Inspecting State
+### D. Architectural Review (Gatekeeper Agent)
+Once the tests pass, the **Gatekeeper Agent** steps in as the senior reviewer. The Gatekeeper does not just blindly look at a diff; it runs its own ReAct tool loop. It proactively searches the codebase to verify that the worker's changes didn't accidentally break a downstream dependency or violate system architecture rules.
+If the Gatekeeper rejects the implementation, it returns a detailed critique, sending the loop back to the Worker (or back to the Supervisor if the plan itself was flawed).
 
-Recent release arcs:
+## 4. Finalization
+Once every atomic task has successfully passed the Test Writer, Worker, Verifier, and Gatekeeper, the pipeline performs a final, holistic check:
+- The Verifier runs a global build/test check across the entire repository.
+- The Gatekeeper performs a broad-context review of the total compiled diff against the original issue.
 
-```bash
-sqlite3 trust_ledger.db "SELECT id, issue_id, status, updated_at FROM release_arcs ORDER BY id DESC LIMIT 10;"
-```
-
-Task status:
-
-```bash
-sqlite3 trust_ledger.db "SELECT task_id, status, substr(commit_sha,1,8), updated_at FROM tasks ORDER BY id DESC LIMIT 20;"
-```
-
-Verification evidence:
-
-```bash
-sqlite3 trust_ledger.db "SELECT task_id, status, reason FROM verification_runs ORDER BY id DESC LIMIT 10;"
-```
-
-Gatekeeper rejections:
-
-```bash
-sqlite3 trust_ledger.db "SELECT task_id, gate_name, error_type, critique_summary FROM gate_reviews WHERE status = 'rejected' ORDER BY id DESC LIMIT 10;"
-```
-
-Failure classifications:
-
-```bash
-sqlite3 trust_ledger.db "SELECT task_id, failure_class, recommended_action, confidence FROM failure_analyses ORDER BY id DESC LIMIT 20;"
-```
-
-Prompt and model route history:
-
-```bash
-sqlite3 trust_ledger.db "SELECT task_id, attempt_number, substr(prompt_hash,1,12), model_route FROM prompt_rewrites ORDER BY id DESC LIMIT 20;"
-```
-
-Rule proposals:
-
-```bash
-sqlite3 trust_ledger.db "SELECT id, scope, confidence, status, rule_text FROM rule_proposals ORDER BY id DESC LIMIT 20;"
-```
-
-Approve a proposed rule:
-
-```bash
-sqlite3 trust_ledger.db "UPDATE rule_proposals SET status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = 1;"
-```
-
-Replay self-improvement analysis without invoking Codex or LLMs:
-
-```bash
-PYTHONPATH=. .venv/bin/python scripts/replay_self_improvement.py 1 --project test-data-generator
-```
-
-## Recovery
-
-Failed attempts are reset inside the isolated worktree, not the source checkout. Successful task checkpoints remain as commits on the arc branch.
-
-If a worktree becomes invalid, remove it manually after confirming you do not need its uncommitted contents, then rerun the pipeline. GATE will recreate it from the source repository.
-
-## Tuning
-
-Primary settings are in `GateConfig`:
-
-- `max_task_attempts`: increase for difficult tasks.
-- `allow_dependency_install`: disable if the sandbox must never touch registries.
-- `use_git_worktree`: keep enabled for safety.
-- `codex_command`: set if Codex is installed under a different command name.
-- `model_policy`: use `policy_ladder` for adaptive cost/quality routing.
-- `rule_mode`: keep `review_first` when mined rules should require approval.
-- `max_prompt_rewrites` and `max_plan_repairs`: bound self-improvement loops.
+Upon final approval, the isolated worktree is committed, the MCP servers gracefully shut down, and the feature is ready to be merged into your main branch.
