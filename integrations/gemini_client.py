@@ -34,8 +34,9 @@ class LLMClient:
                     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
                 ]
             }
-            if response_format:
-                kwargs["response_format"] = response_format
+            # DeepSeek rejects strict response_format objects, and our regex parser handles raw text perfectly now
+            # if response_format:
+            #     kwargs["response_format"] = response_format
             if tools:
                 kwargs["tools"] = tools
                 
