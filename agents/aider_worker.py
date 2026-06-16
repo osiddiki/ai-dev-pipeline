@@ -48,11 +48,21 @@ class AiderWorkerAgent(BaseAgent):
             ]
             
             for allowed_file in input_data.allowed_files:
+                if (
+                    allowed_file.endswith(".pyc") 
+                    or "__pycache__" in allowed_file.split("/") 
+                    or allowed_file.endswith(".tmp")
+                ):
+                    continue
                 file_path = repo_path / allowed_file
-                if file_path.exists() or not file_path.parent.exists():
-                    cmd.append(allowed_file)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                cmd.append(allowed_file)
 
+            import sys
             env = os.environ.copy()
+            venv_bin = Path(sys.executable).parent
+            if venv_bin.exists():
+                env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -103,21 +113,21 @@ class AiderWorkerAgent(BaseAgent):
         attempt = context.get("attempt", 1)
         feedback = context.get("feedback", "")
         repair_brief = context.get("repair_brief", "")
-        
-        if attempt > 1:
-            return f"""The previous attempt failed. Please fix the following errors:
-
-{feedback}
-
-Repair brief for this attempt:
-{repair_brief}
-
-Make the smallest coherent change required to fix these issues. Do not run any package install commands."""
-
         active_rules = context.get("active_rules", "")
         issue = context.get("issue_description", "")
         guidelines = context.get("guidelines", "")
         discovery_report = context.get("discovery_report", "")
+        allowed_files = "\n".join(f"- {path}" for path in task.allowed_files) or "- No explicit allowlist provided"
+
+        retry_context = ""
+        if attempt > 1:
+            retry_context = f"""
+Previous attempt failure:
+{feedback or "No failure summary provided."}
+
+Repair brief for this attempt:
+{repair_brief or "No repair brief provided."}
+"""
 
         return f"""You are the implementation worker inside the GATE autonomous development pipeline.
 
@@ -133,6 +143,9 @@ Design constraints:
 Acceptance criteria:
 {task.acceptance_criteria}
 
+Allowed files for this task:
+{allowed_files}
+
 Project guidelines:
 {guidelines}
 
@@ -141,9 +154,11 @@ Active learned rules:
 
 Technical discovery report:
 {discovery_report}
+{retry_context}
 
 Rules:
 - Make the smallest coherent change required by the task.
+- Only modify files from the allowed file list unless the pipeline later expands the allowlist.
 - Do not run package install commands unless the task explicitly requires dependency installation.
 - Prefer existing project conventions over new abstractions.
 """
@@ -162,7 +177,11 @@ Rules:
     def _changed_files(self, repo_path: Path) -> List[str]:
         tracked = self._run_git(repo_path, ["diff", "--name-only"]).splitlines()
         untracked = self._run_git(repo_path, ["ls-files", "--others", "--exclude-standard"]).splitlines()
-        return sorted({p for p in tracked + untracked if p.strip()})
+        all_changed = sorted({p for p in tracked + untracked if p.strip()})
+        return [
+            p for p in all_changed
+            if not p.endswith(".pyc") and "__pycache__" not in p.split("/") and not p.endswith(".tmp")
+        ]
 
     def _diff_with_untracked(self, repo_path: Path, changed_files: List[str]) -> str:
         diff = self._run_git(repo_path, ["diff", "--no-ext-diff", "--binary"])
@@ -170,6 +189,12 @@ Rules:
         chunks = [diff.rstrip()] if diff.strip() else []
 
         for rel_path in untracked:
+            if (
+                rel_path.endswith(".pyc") 
+                or "__pycache__" in rel_path.split("/") 
+                or rel_path.endswith(".tmp")
+            ):
+                continue
             file_path = repo_path / rel_path
             if not file_path.is_file():
                 continue

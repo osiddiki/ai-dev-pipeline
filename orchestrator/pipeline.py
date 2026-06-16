@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import traceback
@@ -11,6 +12,15 @@ from typing import List, Optional
 
 import structlog
 import yaml
+
+# Redirect structlog console output to pipeline.log to clean up stdout
+try:
+    log_file = open("pipeline.log", "a", encoding="utf-8")
+    structlog.configure(
+        logger_factory=structlog.WriteLoggerFactory(file=log_file)
+    )
+except Exception:
+    pass
 
 from agents.aider_worker import AiderWorkerAgent
 from agents.gatekeeper import GateResult, GatekeeperAgent
@@ -79,7 +89,7 @@ class GateUI:
 
 
 class ReleaseArcOrchestrator:
-    """GATE release controller with Codex as the implementation worker."""
+    """GATE release controller with Aider as the implementation worker."""
 
     def __init__(self, target_repo: str, guidelines: Optional[str] = None, config: Optional[GateConfig] = None):
         self.source_repo = Path(target_repo).resolve()
@@ -92,7 +102,8 @@ class ReleaseArcOrchestrator:
         self.supervisor = SupervisorAgent(model_id=self.config.planner_model)
 
         self.worker = AiderWorkerAgent(model_id=self.config.executor_model)
-        GateUI.step("setup", f"Using Aider Agent Worker with {self.config.executor_model}")
+        if self.config.show_ui_steps:
+            GateUI.step("setup", f"Using Aider Agent Worker with {self.config.executor_model}")
 
         self.gatekeeper = GatekeeperAgent(model_id=self.config.verifier_model)
         self.researcher = ResearcherAgent(model_id=self.config.planner_model)
@@ -105,6 +116,57 @@ class ReleaseArcOrchestrator:
         self.rule_store = RuleStore(self.metadata_dir)
         self.rule_miner = RuleMiner()
         self.circuit_breaker = CircuitBreaker()
+        self.rag_provider = "local"
+
+    def _default_rag_provider(self) -> str:
+        provider = (os.environ.get("GATE_RAG_PROVIDER") or "").strip().lower()
+        if provider in {"disabled", "local", "api"}:
+            return provider
+        return "local"
+
+    def _should_disable_semantic_rag(self, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
+        text = issue_description.lower().strip()
+        simple_markers = (
+            "typo",
+            "rename",
+            "readme",
+            "docs",
+            "documentation",
+            "format",
+            "lint",
+            "version",
+            "changelog",
+            "comment",
+            "whitespace",
+            "small",
+            "trivial",
+        )
+        code_markers = (
+            "api",
+            "database",
+            "schema",
+            "refactor",
+            "feature",
+            "test",
+            "bug",
+            "generate",
+            "workflow",
+            "typescript",
+            "python",
+            "javascript",
+        )
+        simple_text = len(text) < 120 or len(text.split()) < 18
+        simple_shape = any(marker in text for marker in simple_markers) and not any(marker in text for marker in code_markers)
+        single_file_hint = bool(manual_plan and len(manual_plan.tasks) == 1 and len(manual_plan.tasks[0].allowed_files) <= 1)
+        return (simple_text and simple_shape) or single_file_hint
+
+    def _resolve_rag_provider(self, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> str:
+        provider = self._default_rag_provider()
+        if provider == "disabled":
+            return provider
+        if self._should_disable_semantic_rag(issue_description, manual_plan):
+            return "disabled"
+        return provider
 
     async def process_issue(
         self,
@@ -121,6 +183,7 @@ class ReleaseArcOrchestrator:
             arc_id = await self._get_or_create_arc(db, issue_id)
             active_rules = await self.rule_store.load_active_rules(db, self.project_name)
             active_rules_text = self.rule_store.render_for_prompt(active_rules)
+            self.rag_provider = self._resolve_rag_provider(issue_description, manual_plan)
 
             GateUI.header(f"MISSION: {issue_id}")
             if active_rules:
@@ -134,7 +197,15 @@ class ReleaseArcOrchestrator:
             await db.commit()
 
             base_sha = self._git(work_repo, ["rev-parse", "HEAD"]).strip()
+            startup_route = self.model_router.route(None, attempt=1)
+            self.researcher.model_id = startup_route.classifier_model
+            self.meta_analyzer.model_id = startup_route.classifier_model
             repo_context = await self.gather_context(work_repo)
+
+            meta_result = await self.meta_analyzer.invoke({}, db)
+            historical_warning = meta_result.output.strip() if meta_result.success and meta_result.output else ""
+            if historical_warning:
+                GateUI.step("history", "Loaded historical failure warning for this arc.")
 
             GateUI.step("context", "Building technical discovery report.")
             research_result = await self.researcher.invoke(
@@ -142,6 +213,11 @@ class ReleaseArcOrchestrator:
                 issue_description,
             )
             discovery_report = research_result.output
+            if historical_warning:
+                discovery_report = (
+                    f"{discovery_report}\n\n"
+                    f"Historical failure warning:\n{historical_warning}"
+                )
 
             plan = await self._load_or_create_plan(
                 db=db,
@@ -152,6 +228,7 @@ class ReleaseArcOrchestrator:
                 discovery_report=discovery_report,
                 manual_plan=manual_plan,
                 active_rules_text=active_rules_text,
+                rag_provider=self.rag_provider,
             )
             if not plan:
                 await self._fail_arc(db, arc_id)
@@ -159,11 +236,10 @@ class ReleaseArcOrchestrator:
 
             await self._persist_tasks(db, arc_id, plan)
 
-            independent = all(not task.dependencies for task in plan.tasks)
-            
-            if independent and len(plan.tasks) > 1:
+            can_parallelize = self._tasks_can_run_in_parallel(plan.tasks)
+
+            if can_parallelize and len(plan.tasks) > 1:
                 GateUI.step("parallel", f"Executing {len(plan.tasks)} independent tasks in parallel")
-                import shutil
                 task_repos = []
                 for task in plan.tasks:
                     task_repo = work_repo.parent / f"{work_repo.name}_{task.id}"
@@ -190,9 +266,22 @@ class ReleaseArcOrchestrator:
                         return False
                 
                 for task in plan.tasks:
-                    subprocess.run(["git", "merge", f"gate_{arc_id}_{task.id}", "--no-edit"], cwd=str(work_repo), check=False)
-                    
+                    merge = subprocess.run(
+                        ["git", "merge", f"gate_{arc_id}_{task.id}", "--no-edit"],
+                        cwd=str(work_repo),
+                        check=False,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                    if merge.returncode != 0:
+                        GateUI.error(f"Failed to merge parallel task branch {task.id}.", merge.stdout)
+                        await self._fail_arc(db, arc_id)
+                        return False
+
             else:
+                if len(plan.tasks) > 1:
+                    GateUI.step("parallel", "Falling back to sequential execution because task allowlists overlap or dependencies exist.")
                 index = 0
                 while index < len(plan.tasks):
                     task = plan.tasks[index]
@@ -228,7 +317,7 @@ class ReleaseArcOrchestrator:
                 GateUI.step("verify", "Running final release verification.")
                 sandbox = PipelineMCPClient(str(work_repo))
                 await sandbox.connect()
-                final_verifier = VerifierEngine(sandbox, planner_model=self.config.planner_model)
+                final_verifier = VerifierEngine(sandbox)
                 final_result = await final_verifier.verify_release(repo_context, release_files)
                 await sandbox.disconnect()
                 await self._record_verification(db, arc_id, None, final_result, 1, release_files)
@@ -238,7 +327,14 @@ class ReleaseArcOrchestrator:
                     return False
 
             if all_diffs:
-                system_gate = await self.gatekeeper.review_code(issue_description, plan, all_diffs, active_rules_text)
+                system_gate = await self.gatekeeper.review_code(
+                    issue_description,
+                    plan,
+                    all_diffs,
+                    active_rules_text,
+                    repo_path=str(work_repo),
+                    rag_provider=self.rag_provider,
+                )
                 await self._record_gate(db, arc_id, None, "review_code", system_gate, 1)
                 GateUI.gate_result("system", system_gate.approved, system_gate.critique)
                 if not system_gate.approved:
@@ -260,8 +356,78 @@ class ReleaseArcOrchestrator:
             return False
 
     async def gather_context(self, repo_path: Path) -> str:
-        # Context is now dynamically gathered by agent tools
-        return f"Base repository path: {repo_path}"
+        def run_capture(args: List[str]) -> str:
+            result = subprocess.run(
+                args,
+                cwd=str(repo_path),
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            return result.stdout.strip()
+
+        top_level = run_capture(["rg", "--files", "-g", "*", "--max-depth", "2"]) if shutil.which("rg") else ""
+        if top_level:
+            top_entries = top_level.splitlines()[:80]
+        else:
+            top_entries = sorted(
+                str(path.relative_to(repo_path))
+                for path in repo_path.rglob("*")
+                if len(path.relative_to(repo_path).parts) <= 2
+            )[:80]
+
+        key_files = [
+            rel
+            for rel in top_entries
+            if Path(rel).name in {
+                "package.json",
+                "tsconfig.json",
+                "pyproject.toml",
+                "requirements.txt",
+                "README.md",
+                "docker-compose.yml",
+                "Dockerfile",
+                ".env.example",
+            }
+        ]
+
+        languages = sorted(
+            {
+                suffix
+                for suffix in (
+                    Path(rel).suffix.lower()
+                    for rel in top_entries
+                    if Path(rel).suffix
+                )
+                if suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".yml", ".yaml"}
+            }
+        )
+
+        if shutil.which("rg"):
+            package_files = run_capture(
+                ["rg", "--files", "-g", "package.json", "-g", "pyproject.toml", "-g", "requirements.txt"]
+            )
+            package_paths = package_files.splitlines()[:20] if package_files else []
+        else:
+            package_paths = [
+                str(path.relative_to(repo_path))
+                for path in repo_path.rglob("*")
+                if path.is_file() and path.name in {"package.json", "pyproject.toml", "requirements.txt"}
+            ][:20]
+
+        git_status = self._git(repo_path, ["status", "--short"]).splitlines()[:40]
+
+        return (
+            f"Repository root: {repo_path}\n"
+            f"Detected languages: {', '.join(languages) or 'unknown'}\n"
+            f"Key files: {json.dumps(key_files[:20])}\n"
+            f"Package manifests: {json.dumps(package_paths)}\n"
+            f"Top-level repo snapshot ({len(top_entries)} items):\n"
+            + "\n".join(f"- {entry}" for entry in top_entries)
+            + "\n\nCurrent git status:\n"
+            + ("\n".join(git_status) if git_status else "clean")
+        )
 
     async def _execute_task(
         self,
@@ -324,11 +490,35 @@ class ReleaseArcOrchestrator:
                 route.reason,
             )
             
-            if getattr(task, "requires_tests", True):
+            should_write_tests = self._should_run_test_writer(task)
+            if should_write_tests:
                 GateUI.step("tdd", "Invoking Test Writer Agent")
                 test_result = await self.test_writer.invoke(worker_context, task)
+                if not test_result.success:
+                    analysis = await self._handle_failed_attempt(
+                        db=db,
+                        arc_id=arc_id,
+                        task=task,
+                        attempt=attempt,
+                        changed_files=[],
+                        worker_error=f"Test Writer Agent failed: {test_result.output}",
+                        failure_history=failure_history,
+                        changed_file_history=changed_file_history,
+                    )
+                    failure_history.append(analysis)
+                    feedback, repair_brief, prompt_rewrites = self._next_repair_prompt(
+                        task=task,
+                        issue_description=issue_description,
+                        analysis=analysis,
+                        changed_files=[],
+                        prior_diff="",
+                        active_rules=active_rules,
+                        prompt_rewrites=prompt_rewrites,
+                    )
+                    GateUI.warning(feedback)
+                    continue
             else:
-                GateUI.step("tdd", "Skipping Test Writer Agent (requires_tests=False)")
+                GateUI.step("tdd", "Skipping Test Writer Agent (no explicit test targets in allowlist)")
 
             GateUI.step("execute", "Invoking Worker Agent")
             worker_result = await self.worker.invoke(
@@ -374,7 +564,7 @@ class ReleaseArcOrchestrator:
             w_out.changed_files = changed_files
             w_out.diff = diff
 
-            allowlist_error = self._validate_changed_files(task, changed_files)
+            allowlist_error = self._validate_changed_files(task, changed_files, work_repo)
             if allowlist_error:
                 analysis = await self._handle_failed_attempt(
                     db=db,
@@ -442,7 +632,7 @@ class ReleaseArcOrchestrator:
                 w_out.changed_files = changed_files
                 w_out.diff = self._diff(work_repo)
 
-                allowlist_error = self._validate_changed_files(task, changed_files)
+                allowlist_error = self._validate_changed_files(task, changed_files, work_repo)
                 if allowlist_error:
                     analysis = await self._handle_failed_attempt(
                         db=db,
@@ -484,11 +674,11 @@ class ReleaseArcOrchestrator:
 
             sandbox = PipelineMCPClient(str(work_repo))
             await sandbox.connect()
-            verifier = VerifierEngine(sandbox, planner_model=self.config.planner_model)
+            verifier = VerifierEngine(sandbox)
             verification = await verifier.verify(
                 task_description=task.description,
                 repo_context=repo_context,
-                changed_files=changed_files,
+                changed_files=changed_files or task.allowed_files,
                 acceptance_criteria=task.acceptance_criteria,
             )
             await sandbox.disconnect()
@@ -544,7 +734,13 @@ class ReleaseArcOrchestrator:
                 GateUI.warning(feedback)
                 continue
 
-            code_gate = await self.gatekeeper.codereview(task, w_out, active_rules_text)
+                code_gate = await self.gatekeeper.codereview(
+                    task,
+                    w_out,
+                    active_rules_text,
+                    repo_path=str(work_repo),
+                    rag_provider=self.rag_provider,
+                )
             await self._record_gate(db, arc_id, task.id, "codereview", code_gate, attempt)
             GateUI.gate_result("code", code_gate.approved, code_gate.critique)
             if not code_gate.approved:
@@ -615,6 +811,7 @@ class ReleaseArcOrchestrator:
         discovery_report: str,
         manual_plan: Optional[SupervisorPlan],
         active_rules_text: str,
+        rag_provider: str,
     ) -> Optional[SupervisorPlan]:
         plan = manual_plan or self._load_plan_file(issue_id)
         guidelines = f"{self.guidelines}\n\nAPPROVED LEARNED RULES:\n{active_rules_text}"
@@ -627,6 +824,7 @@ class ReleaseArcOrchestrator:
                     "repo_path": str(self.source_repo),
                     "repo_context": repo_context,
                     "discovery_report": discovery_report,
+                    "rag_provider": rag_provider,
                 },
                 issue_description,
             )
@@ -653,6 +851,7 @@ class ReleaseArcOrchestrator:
                     "repo_path": str(self.source_repo),
                     "repo_context": repo_context,
                     "discovery_report": discovery_report,
+                    "rag_provider": rag_provider,
                 },
             )
             if not revision.success:
@@ -1152,13 +1351,20 @@ class ReleaseArcOrchestrator:
                 return f"Dependency install failed in {rel_dir}: {output[:1200]}"
         return None
 
-    def _validate_changed_files(self, task: TaskDefinition, changed_files: List[str]) -> Optional[str]:
+    def _validate_changed_files(self, task: TaskDefinition, changed_files: List[str], work_repo: Optional[Path] = None) -> Optional[str]:
         if not changed_files:
-            return "Codex did not produce any file changes."
+            if work_repo:
+                filtered_allowed = [
+                    path for path in task.allowed_files
+                    if not self._is_dependency_artifact(path) and not self._is_temp_artifact(path)
+                ]
+                if all((work_repo / path).is_file() for path in filtered_allowed):
+                    return None
+            return "Aider did not produce any file changes."
 
         temp_files = [path for path in changed_files if self._is_temp_artifact(path)]
         if temp_files:
-            return f"Codex produced forbidden temporary artifacts: {', '.join(temp_files)}"
+            return f"Aider produced forbidden temporary artifacts: {', '.join(temp_files)}"
 
         protected = self._protected_gate_source_changes(changed_files)
         if protected:
@@ -1175,7 +1381,7 @@ class ReleaseArcOrchestrator:
         unexpected = [path for path in changed_files if path not in allowed]
         if unexpected:
             return (
-                "Codex modified files outside the task allowlist. "
+                "Aider modified files outside the task allowlist. "
                 f"Allowed: {sorted(allowed)}. Unexpected: {unexpected}"
             )
         return None
@@ -1205,10 +1411,12 @@ class ReleaseArcOrchestrator:
 
     def _commit_exact_files(self, work_repo: Path, files: List[str], task_id: str) -> str:
         files = self._normalize_files(files)
-        self._run(["git", "add", "--", *files], work_repo)
+        if files:
+            self._run(["git", "add", "--", *files], work_repo)
         staged = self._git(work_repo, ["diff", "--cached", "--name-only"]).splitlines()
         if not staged:
-            raise RuntimeError("No staged files after exact-file staging.")
+            self._run(["git", "commit", "--allow-empty", "-m", f"GATE: {task_id} (no changes)"], work_repo)
+            return self._git(work_repo, ["rev-parse", "HEAD"]).strip()
         self._run(["git", "commit", "-m", f"GATE: {task_id}"], work_repo)
         return self._git(work_repo, ["rev-parse", "HEAD"]).strip()
 
@@ -1218,7 +1426,7 @@ class ReleaseArcOrchestrator:
         return [
             path
             for path in self._normalize_files(sorted({*tracked, *untracked}))
-            if not self._is_dependency_artifact(path)
+            if not self._is_dependency_artifact(path) and not self._is_temp_artifact(path)
         ]
 
     def _changed_files_between(self, work_repo: Path, base: str, head: str) -> List[str]:
@@ -1266,13 +1474,46 @@ class ReleaseArcOrchestrator:
             normalized.append(path[2:] if path.startswith("./") else path)
         return sorted(set(normalized))
 
+    def _tasks_can_run_in_parallel(self, tasks: List[TaskDefinition]) -> bool:
+        if any(task.dependencies for task in tasks):
+            return False
+
+        seen_files: set[str] = set()
+        for task in tasks:
+            allowlist = set(self._normalize_files(task.allowed_files))
+            if not allowlist:
+                return False
+            if seen_files.intersection(allowlist):
+                return False
+            seen_files.update(allowlist)
+        return True
+
+    def _should_run_test_writer(self, task: TaskDefinition) -> bool:
+        if not getattr(task, "requires_tests", True):
+            return False
+
+        test_markers = ("/tests/", "/__tests__/", ".test.", ".spec.", "test_", "_test.")
+        for rel_path in task.allowed_files:
+            normalized = f"/{rel_path.lower()}"
+            if any(marker in normalized for marker in test_markers):
+                return True
+        return False
+
     def _is_dependency_artifact(self, rel_path: str) -> bool:
         parts = rel_path.split("/")
         return "node_modules" in parts or "vendor" in parts and rel_path.endswith("/vendor")
 
     def _is_temp_artifact(self, rel_path: str) -> bool:
         name = os.path.basename(rel_path)
-        return name.startswith(".tmp") or name.endswith(".tmp") or name.endswith(".bak") or rel_path.endswith(".rej")
+        parts = rel_path.split("/")
+        return (
+            name.startswith(".tmp")
+            or name.endswith(".tmp")
+            or name.endswith(".bak")
+            or rel_path.endswith(".rej")
+            or name.endswith(".pyc")
+            or "__pycache__" in parts
+        )
 
     def _slug(self, value: str) -> str:
         slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-").lower()

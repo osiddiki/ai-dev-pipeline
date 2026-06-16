@@ -9,6 +9,7 @@ __pycache__/
 # GATE Pipeline State & Private Work
 metadata/
 .gate/
+.gate_rag_cache/
 working_documents/
 
 # Temporary / Scratch Files

@@ -41,7 +41,7 @@ Example: [{{"id": "task_1", "description": "Create a JSON writer utility", "targ
 """
 
 WORKER_PROMPT = """
-Deprecated. Implementation is now delegated to CodexWorkerAgent, which edits files directly through codex exec.
+Deprecated. Implementation is now delegated to the Aider worker agent.
 """
 
 GATEKEEPER_PLAN_PROMPT = """
@@ -62,7 +62,7 @@ Provide your response strictly adhering to the requested JSON schema.
 
 GATEKEEPER_CODE_PROMPT = """
 You are the Gatekeeper (The Senior Reviewer). Your job is to verify PROJECT TRUST.
-You are reviewing a git diff produced by Codex after deterministic verification has already passed.
+You are reviewing a git diff produced by the worker after deterministic verification has already passed.
 
 CRITERIA:
 1. Is the work correct and complete?
@@ -74,6 +74,9 @@ ERROR TAXONOMY (If REJECTED, you MUST classify the error):
 - OMISSION: The code missed a part of the task description or left out necessary logic.
 - SYSTEMATIC: The code works but uses the wrong pattern, inefficient logic, or violates project guidelines.
 - INCOHERENT: The diff is internally inconsistent, references variables that do not exist, or implements a hallucinated solution.
+
+CRITICAL RULE FOR EMPTY/MINIMAL DIFFS:
+If the logic required by the task is ALREADY fully and correctly implemented in the target files (for example, written during a previous task), you MUST approve the task. Do not reject a task for having an empty or minimal diff (like only adding docstrings, comments, or minor tweaks) if the target files already contain the complete, correct implementation of the requested features.
 
 OUTPUT FORMAT:
 You MUST follow the requested JSON schema structure. Put your step-by-step thinking in the review_summary.

@@ -40,7 +40,7 @@ class JavaScriptValidator(FileValidator):
 
 class PythonValidator(FileValidator):
     async def validate(self, rel_path: str) -> VerificationResult:
-        cmd = f"python -m py_compile {shlex.quote(rel_path)}"
+        cmd = f"python3 -m py_compile {shlex.quote(rel_path)}"
         output, code = await self.sandbox.execute_command(cmd)
         if code != 0:
             return VerificationResult(success=False, reason=f"Python syntax failed for {rel_path}: {output[:800]}", used_command=cmd, evidence=output)
@@ -58,7 +58,7 @@ class TypeScriptValidator(FileValidator):
 class VerifierEngine:
     """Deterministic verifier for GATE task acceptance."""
 
-    def __init__(self, sandbox: PipelineMCPClient, planner_model: str = "deepseek/deepseek-chat"):
+    def __init__(self, sandbox: PipelineMCPClient):
         self.sandbox = sandbox
         self.repo_root = Path(self.sandbox.target_repo_path).resolve()
 

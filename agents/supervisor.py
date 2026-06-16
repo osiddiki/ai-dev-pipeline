@@ -40,8 +40,11 @@ class SupervisorAgent(BaseAgent):
         logger.info("Supervisor planning task", task=input_data[:50])
         
         repo_path = context.get("repo_path", ".")
-        tool_handler = CodebaseTools(repo_path)
-        tool_handler.rag.build_index()
+        tool_handler = CodebaseTools(
+            repo_path,
+            provider=context.get("rag_provider"),
+            model_id=context.get("rag_model_id"),
+        )
         guidelines = context.get("guidelines", "Follow professional best practices.")
         
         system_prompt = f"""You are the Supervisor Agent for the GATE autonomous pipeline.
@@ -52,6 +55,7 @@ Explore the codebase carefully. When you have gathered enough information, outpu
 Your final response must be ONLY a valid JSON array of tasks matching this schema:
 [{{ "id": "task-1", "description": "...", "target_files": ["src/app.py"], "dependencies": [], "design_constraints": "...", "acceptance_criteria": "...", "requires_tests": true }}]
 You can set "requires_tests": false for tasks involving static content, basic CSS/UI updates, or simple documentation.
+If "requires_tests" is true, the task's "target_files" must include the test file paths the pipeline is allowed to create or update.
 """
         
         messages = [
@@ -132,8 +136,11 @@ You can set "requires_tests": false for tasks involving static content, basic CS
         logger.info("Supervisor revising plan based on critique")
         
         repo_path = context.get("repo_path", ".")
-        tool_handler = CodebaseTools(repo_path)
-        tool_handler.rag.build_index()
+        tool_handler = CodebaseTools(
+            repo_path,
+            provider=context.get("rag_provider"),
+            model_id=context.get("rag_model_id"),
+        )
         guidelines = context.get("guidelines", "Follow professional best practices.")
         
         system_prompt = f"""You are the Supervisor Agent.
@@ -141,6 +148,7 @@ Your job is to revise a previously rejected plan. Use tools to investigate why i
 Project guidelines: {guidelines}
 
 Output your final revised plan as a JSON array.
+If "requires_tests" is true for a task, include the test file paths in that task's "target_files".
 """
         
         messages = [

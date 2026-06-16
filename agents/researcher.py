@@ -1,5 +1,7 @@
 from typing import Any
 import asyncio
+import re
+import shlex
 from .base import BaseAgent, AgentResult
 from .prompts import RESEARCHER_PROMPT
 from integrations.gemini_client import LLMClient
@@ -24,10 +26,20 @@ class ResearcherAgent(BaseAgent):
         await sandbox.connect()
         
         # 1. Step 1: Broad Search
-        # We run a multi-keyword grep to find likely candidates
-        keywords = task_description.split()
-        search_terms = "|".join([k for k in keywords if len(k) > 4][:5]) # Top 5 long words
-        grep_results, _ = await sandbox.execute_command(f"grep -rEi '{search_terms}' . --exclude-dir={{.git,node_modules,dist,build}} | head -n 30")
+        # Prefer fast ripgrep with a small escaped keyword set, then fall back to grep.
+        keywords = re.findall(r"[A-Za-z0-9_-]{5,}", task_description)
+        search_terms = "|".join(re.escape(keyword) for keyword in keywords[:5]) or "TODO"
+        rg_cmd = (
+            f"rg -n -i -m 30 -e {shlex.quote(search_terms)} . "
+            "-g '!node_modules/**' -g '!dist/**' -g '!build/**' -g '!.git/**'"
+        )
+        grep_results, code = await sandbox.execute_command(rg_cmd)
+        if code != 0:
+            grep_cmd = (
+                f"grep -rEi {shlex.quote(search_terms)} . "
+                "--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=build | head -n 30"
+            )
+            grep_results, _ = await sandbox.execute_command(grep_cmd)
         await sandbox.disconnect()
         
         # 2. Step 2: Agentic Synthesis

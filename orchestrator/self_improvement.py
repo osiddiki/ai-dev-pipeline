@@ -97,7 +97,7 @@ class FailureAnalyzer:
                     )
             return FailureAnalysis("scope_drift", 0.9, allowlist_error, "rewrite_prompt")
 
-        if any(marker in text for marker in ("codex exited", "command not found", "permission denied")):
+        if any(marker in text for marker in ("aider exited", "command not found", "permission denied")):
             return FailureAnalysis("environment_issue", 0.86, evidence, "block_environment")
 
         if any(marker in text for marker in ("npm install failed", "dependency install failed", "cannot find module", "missing external dependency")):
@@ -465,7 +465,7 @@ class CircuitBreaker:
                 if analyses[-1].failure_class == analyses[-2].failure_class:
                     return "Two consecutive attempts produced the same changed files and failure class."
         if len(analyses) >= 2 and all(a.failure_class == "scope_drift" for a in analyses[-2:]):
-            return "Codex repeatedly edited outside the task allowlist."
+            return "The worker repeatedly edited outside the task allowlist."
         if analyses[-1].failure_class in {"environment_issue", "dependency_issue"}:
             return "Failure is deterministic environment/dependency related; retrying code generation is unlikely to help."
         return None

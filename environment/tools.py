@@ -4,10 +4,22 @@ from pathlib import Path
 import json
 
 class CodebaseTools:
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str, provider: str | None = None, model_id: str | None = None):
         self.repo_path = Path(repo_path).resolve()
-        from environment.rag import CodebaseRAG
-        self.rag = CodebaseRAG(str(self.repo_path))
+        self._rag = None
+        self._rag_provider = provider
+        self._rag_model_id = model_id
+
+    @property
+    def rag(self):
+        if self._rag is None:
+            from environment.rag import CodebaseRAG
+            self._rag = CodebaseRAG(
+                str(self.repo_path),
+                provider=self._rag_provider,
+                model_id=self._rag_model_id,
+            )
+        return self._rag
 
     def _resolve_path(self, target_path: str) -> Path:
         target = (self.repo_path / target_path).resolve()
@@ -39,11 +51,20 @@ class CodebaseTools:
     def search_codebase(self, query: str, path: str = ".") -> str:
         try:
             target = self._resolve_path(path)
-            result = subprocess.run(
-                ["grep", "-rnI", query, str(target)],
-                text=True,
-                capture_output=True
-            )
+            try:
+                result = subprocess.run(
+                    ["rg", "-n", "--no-heading", query, str(target)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+            except FileNotFoundError:
+                result = subprocess.run(
+                    ["grep", "-rnI", query, str(target)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
             out = result.stdout.strip()
             if not out:
                 return f"No results found for '{query}' in {path}"
@@ -72,6 +93,7 @@ class CodebaseTools:
 
     def semantic_code_search(self, query: str) -> str:
         """Perform a semantic vector search across the entire codebase."""
+        self.rag.build_index()
         return self.rag.search(query)
 
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
