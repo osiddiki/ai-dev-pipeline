@@ -7,7 +7,7 @@ import structlog
 logger = structlog.get_logger()
 
 class LiteLLMEmbeddingFunction(EmbeddingFunction):
-    def __init__(self, model_id: str = "gemini/text-embedding-004"):
+    def __init__(self, model_id: str = "gemini/embedding-001"):
         self.model_id = model_id
 
     def __call__(self, input: Documents) -> Embeddings:
@@ -20,7 +20,7 @@ class LiteLLMEmbeddingFunction(EmbeddingFunction):
             raise RuntimeError(f"API Embedding failed: {str(e)}")
 
 class CodebaseRAG:
-    def __init__(self, repo_path: str, model_id: str = "gemini/text-embedding-004"):
+    def __init__(self, repo_path: str, model_id: str = "gemini/embedding-001"):
         self.repo_path = Path(repo_path).resolve()
         self.db_path = self.repo_path / ".gate_rag_cache"
         self.client = chromadb.PersistentClient(path=str(self.db_path))
