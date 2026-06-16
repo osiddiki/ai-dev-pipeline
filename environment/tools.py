@@ -4,15 +4,21 @@ from pathlib import Path
 import json
 
 class CodebaseTools:
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str, provider: str | None = None, model_id: str | None = None):
         self.repo_path = Path(repo_path).resolve()
         self._rag = None
+        self._rag_provider = provider
+        self._rag_model_id = model_id
 
     @property
     def rag(self):
         if self._rag is None:
             from environment.rag import CodebaseRAG
-            self._rag = CodebaseRAG(str(self.repo_path))
+            self._rag = CodebaseRAG(
+                str(self.repo_path),
+                provider=self._rag_provider,
+                model_id=self._rag_model_id,
+            )
         return self._rag
 
     def _resolve_path(self, target_path: str) -> Path:

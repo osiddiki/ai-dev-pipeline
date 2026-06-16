@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from orchestrator.pipeline import ReleaseArcOrchestrator
+from agents.models import GateConfig
 from agents.supervisor import TaskDefinition
 
 
@@ -11,7 +12,7 @@ class PipelineHelperTests(unittest.TestCase):
     def test_parallel_execution_requires_disjoint_allowlists(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
-            orchestrator = ReleaseArcOrchestrator(str(repo))
+            orchestrator = ReleaseArcOrchestrator(str(repo), config=GateConfig(show_ui_steps=False))
 
             task_a = TaskDefinition(id="a", description="A", target_files=["src/a.ts"])
             task_b = TaskDefinition(id="b", description="B", target_files=["src/b.ts"])
@@ -23,7 +24,7 @@ class PipelineHelperTests(unittest.TestCase):
     def test_test_writer_requires_explicit_test_targets(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
-            orchestrator = ReleaseArcOrchestrator(str(repo))
+            orchestrator = ReleaseArcOrchestrator(str(repo), config=GateConfig(show_ui_steps=False))
 
             task_with_tests = TaskDefinition(
                 id="a",
@@ -48,7 +49,7 @@ class PipelineHelperTests(unittest.TestCase):
             (repo / "src" / "app.ts").write_text("export const app = true;\n", encoding="utf-8")
             (repo / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
 
-            orchestrator = ReleaseArcOrchestrator(str(repo))
+            orchestrator = ReleaseArcOrchestrator(str(repo), config=GateConfig(show_ui_steps=False))
             orchestrator._ensure_git_repo(repo)
 
             context = asyncio.run(orchestrator.gather_context(repo))
@@ -57,6 +58,22 @@ class PipelineHelperTests(unittest.TestCase):
         self.assertIn("Detected languages:", context)
         self.assertIn("package.json", context)
         self.assertIn("Current git status:", context)
+
+    def test_simple_issue_disables_semantic_rag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orchestrator = ReleaseArcOrchestrator(str(Path(tmpdir)), config=GateConfig(show_ui_steps=False))
+
+            provider = orchestrator._resolve_rag_provider("Fix a typo in the README")
+
+        self.assertEqual(provider, "disabled")
+
+    def test_regular_issue_keeps_semantic_rag_local(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orchestrator = ReleaseArcOrchestrator(str(Path(tmpdir)), config=GateConfig(show_ui_steps=False))
+
+            provider = orchestrator._resolve_rag_provider("Add a new patient export generator")
+
+        self.assertEqual(provider, "local")
 
 
 if __name__ == "__main__":

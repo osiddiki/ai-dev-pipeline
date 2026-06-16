@@ -115,11 +115,19 @@ class GatekeeperAgent(BaseAgent):
         raw_response, metrics = await LLMClient.chat(model_id=self.model_id, messages=messages, response_format=GateReviewReport)
         return self._parse_response(raw_response, metrics)
 
-    async def codereview(self, task: TaskDefinition, worker_result: WorkerResult, active_rules: str = "", repo_path: str = ".") -> GateResult:
+    async def codereview(
+        self,
+        task: TaskDefinition,
+        worker_result: WorkerResult,
+        active_rules: str = "",
+        repo_path: str = ".",
+        rag_provider: str | None = None,
+        rag_model_id: str | None = None,
+    ) -> GateResult:
         """Gate 3: Narrow context file-scoped review."""
         logger.info("Gatekeeper running 'codereview' gate", task=task.id)
         
-        tool_handler = CodebaseTools(repo_path)
+        tool_handler = CodebaseTools(repo_path, provider=rag_provider, model_id=rag_model_id)
 
         schema_str = GateReviewReport.schema_json()
         system_prompt = (
@@ -143,11 +151,20 @@ class GatekeeperAgent(BaseAgent):
         
         return await self._run_tool_loop(messages, tool_handler)
 
-    async def review_code(self, issue: str, plan: SupervisorPlan, diffs: List[WorkerResult], active_rules: str = "", repo_path: str = ".") -> GateResult:
+    async def review_code(
+        self,
+        issue: str,
+        plan: SupervisorPlan,
+        diffs: List[WorkerResult],
+        active_rules: str = "",
+        repo_path: str = ".",
+        rag_provider: str | None = None,
+        rag_model_id: str | None = None,
+    ) -> GateResult:
         """Gate 4: Broad context task validation."""
         logger.info("Gatekeeper running 'review_code' gate against original issue.")
         
-        tool_handler = CodebaseTools(repo_path)
+        tool_handler = CodebaseTools(repo_path, provider=rag_provider, model_id=rag_model_id)
 
         schema_str = GateReviewReport.schema_json()
         system_prompt = (

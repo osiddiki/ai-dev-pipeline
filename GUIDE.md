@@ -46,8 +46,8 @@ Upon final approval, the isolated worktree is committed, the MCP servers gracefu
 Semantic retrieval is now optional and budget-aware:
 
 - `GATE_RAG_PROVIDER=disabled` keeps the pipeline on the cheapest path and relies on `rg` plus `grep-ast`
-- `GATE_RAG_PROVIDER=local` enables a local `sentence-transformers` embedding model
+- `GATE_RAG_PROVIDER=local` enables the default local `sentence-transformers` embedding model
 - `GATE_RAG_PROVIDER=api` enables hosted embeddings through LiteLLM
 - `GATE_GEMINI_SAFETY_MODE=block_none` enables the relaxed Gemini safety override when a workflow explicitly needs it
 
-Recommended default: keep semantic retrieval disabled until plain search quality becomes a real bottleneck.
+Recommended default: keep semantic retrieval local, and let GATE automatically disable it only when the task is trivially small and semantic lookup would be wasted overhead.

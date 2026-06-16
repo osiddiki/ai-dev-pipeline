@@ -49,7 +49,7 @@ class CodebaseRAG:
         self.repo_path = Path(repo_path).resolve()
         self.db_path = self.repo_path / ".gate_rag_cache"
         self.state_path = self.db_path / "index_state.json"
-        self.provider = (provider or os.environ.get("GATE_RAG_PROVIDER", "disabled")).strip().lower()
+        self.provider = (provider or os.environ.get("GATE_RAG_PROVIDER", "local")).strip().lower()
         self.model_id = model_id or os.environ.get("GATE_RAG_MODEL", "BAAI/bge-small-en-v1.5")
         self._client = None
         self._collection = None

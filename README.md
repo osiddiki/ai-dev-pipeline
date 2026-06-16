@@ -47,14 +47,14 @@ Runtime policy defaults live in `agents/models.py`.
 Optional semantic search is controlled by environment variables:
 
 ```bash
-GATE_RAG_PROVIDER=disabled   # default, cheapest path
-GATE_RAG_PROVIDER=local      # local sentence-transformers embeddings
+GATE_RAG_PROVIDER=local      # default, cheapest semantic path
+GATE_RAG_PROVIDER=disabled   # force no semantic lookup for trivial tasks
 GATE_RAG_PROVIDER=api        # hosted embeddings through LiteLLM
 GATE_RAG_MODEL=BAAI/bge-small-en-v1.5
 GATE_GEMINI_SAFETY_MODE=default   # or block_none
 ```
 
-Recommended default: leave semantic search disabled and rely on `rg` plus `grep-ast`, then enable `GATE_RAG_PROVIDER=local` only when repository search quality becomes a real bottleneck.
+Recommended default: use local semantic search, and let GATE auto-disable it only for very simple tasks where it would be wasted overhead.
 
 When semantic search is enabled, GATE stores the vector index in `.gate_rag_cache/` and skips rebuilds when the cached index already matches the repository HEAD commit, provider, and embedding model.
 

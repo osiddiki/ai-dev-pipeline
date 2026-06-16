@@ -19,6 +19,7 @@ class GateConfig(BaseModel):
     allow_dependency_install: bool = True
     protect_gate_source_paths: bool = True
     gemini_safety_mode: Literal["default", "block_none"] = "default"
+    show_ui_steps: bool = True
 
 class GateReviewReport(BaseModel):
     """Structured output for all Gatekeeper reviews."""

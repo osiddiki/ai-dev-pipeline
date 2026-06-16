@@ -45,6 +45,12 @@ class FakeSentenceTransformerEmbeddingFunction:
 
 
 class TestCodebaseRAG(unittest.TestCase):
+    def test_default_provider_is_local(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rag = CodebaseRAG(tmpdir)
+
+        self.assertEqual(rag.provider, "local")
+
     def test_disabled_provider_returns_clear_message(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             rag = CodebaseRAG(tmpdir, provider="disabled")

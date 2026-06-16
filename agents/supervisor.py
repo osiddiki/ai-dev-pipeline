@@ -40,7 +40,11 @@ class SupervisorAgent(BaseAgent):
         logger.info("Supervisor planning task", task=input_data[:50])
         
         repo_path = context.get("repo_path", ".")
-        tool_handler = CodebaseTools(repo_path)
+        tool_handler = CodebaseTools(
+            repo_path,
+            provider=context.get("rag_provider"),
+            model_id=context.get("rag_model_id"),
+        )
         guidelines = context.get("guidelines", "Follow professional best practices.")
         
         system_prompt = f"""You are the Supervisor Agent for the GATE autonomous pipeline.
@@ -132,7 +136,11 @@ If "requires_tests" is true, the task's "target_files" must include the test fil
         logger.info("Supervisor revising plan based on critique")
         
         repo_path = context.get("repo_path", ".")
-        tool_handler = CodebaseTools(repo_path)
+        tool_handler = CodebaseTools(
+            repo_path,
+            provider=context.get("rag_provider"),
+            model_id=context.get("rag_model_id"),
+        )
         guidelines = context.get("guidelines", "Follow professional best practices.")
         
         system_prompt = f"""You are the Supervisor Agent.

@@ -102,7 +102,8 @@ class ReleaseArcOrchestrator:
         self.supervisor = SupervisorAgent(model_id=self.config.planner_model)
 
         self.worker = AiderWorkerAgent(model_id=self.config.executor_model)
-        GateUI.step("setup", f"Using Aider Agent Worker with {self.config.executor_model}")
+        if self.config.show_ui_steps:
+            GateUI.step("setup", f"Using Aider Agent Worker with {self.config.executor_model}")
 
         self.gatekeeper = GatekeeperAgent(model_id=self.config.verifier_model)
         self.researcher = ResearcherAgent(model_id=self.config.planner_model)
@@ -115,6 +116,57 @@ class ReleaseArcOrchestrator:
         self.rule_store = RuleStore(self.metadata_dir)
         self.rule_miner = RuleMiner()
         self.circuit_breaker = CircuitBreaker()
+        self.rag_provider = "local"
+
+    def _default_rag_provider(self) -> str:
+        provider = (os.environ.get("GATE_RAG_PROVIDER") or "").strip().lower()
+        if provider in {"disabled", "local", "api"}:
+            return provider
+        return "local"
+
+    def _should_disable_semantic_rag(self, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> bool:
+        text = issue_description.lower().strip()
+        simple_markers = (
+            "typo",
+            "rename",
+            "readme",
+            "docs",
+            "documentation",
+            "format",
+            "lint",
+            "version",
+            "changelog",
+            "comment",
+            "whitespace",
+            "small",
+            "trivial",
+        )
+        code_markers = (
+            "api",
+            "database",
+            "schema",
+            "refactor",
+            "feature",
+            "test",
+            "bug",
+            "generate",
+            "workflow",
+            "typescript",
+            "python",
+            "javascript",
+        )
+        simple_text = len(text) < 120 or len(text.split()) < 18
+        simple_shape = any(marker in text for marker in simple_markers) and not any(marker in text for marker in code_markers)
+        single_file_hint = bool(manual_plan and len(manual_plan.tasks) == 1 and len(manual_plan.tasks[0].allowed_files) <= 1)
+        return (simple_text and simple_shape) or single_file_hint
+
+    def _resolve_rag_provider(self, issue_description: str, manual_plan: Optional[SupervisorPlan] = None) -> str:
+        provider = self._default_rag_provider()
+        if provider == "disabled":
+            return provider
+        if self._should_disable_semantic_rag(issue_description, manual_plan):
+            return "disabled"
+        return provider
 
     async def process_issue(
         self,
@@ -131,6 +183,7 @@ class ReleaseArcOrchestrator:
             arc_id = await self._get_or_create_arc(db, issue_id)
             active_rules = await self.rule_store.load_active_rules(db, self.project_name)
             active_rules_text = self.rule_store.render_for_prompt(active_rules)
+            self.rag_provider = self._resolve_rag_provider(issue_description, manual_plan)
 
             GateUI.header(f"MISSION: {issue_id}")
             if active_rules:
@@ -175,6 +228,7 @@ class ReleaseArcOrchestrator:
                 discovery_report=discovery_report,
                 manual_plan=manual_plan,
                 active_rules_text=active_rules_text,
+                rag_provider=self.rag_provider,
             )
             if not plan:
                 await self._fail_arc(db, arc_id)
@@ -279,6 +333,7 @@ class ReleaseArcOrchestrator:
                     all_diffs,
                     active_rules_text,
                     repo_path=str(work_repo),
+                    rag_provider=self.rag_provider,
                 )
                 await self._record_gate(db, arc_id, None, "review_code", system_gate, 1)
                 GateUI.gate_result("system", system_gate.approved, system_gate.critique)
@@ -679,12 +734,13 @@ class ReleaseArcOrchestrator:
                 GateUI.warning(feedback)
                 continue
 
-            code_gate = await self.gatekeeper.codereview(
-                task,
-                w_out,
-                active_rules_text,
-                repo_path=str(work_repo),
-            )
+                code_gate = await self.gatekeeper.codereview(
+                    task,
+                    w_out,
+                    active_rules_text,
+                    repo_path=str(work_repo),
+                    rag_provider=self.rag_provider,
+                )
             await self._record_gate(db, arc_id, task.id, "codereview", code_gate, attempt)
             GateUI.gate_result("code", code_gate.approved, code_gate.critique)
             if not code_gate.approved:
@@ -755,6 +811,7 @@ class ReleaseArcOrchestrator:
         discovery_report: str,
         manual_plan: Optional[SupervisorPlan],
         active_rules_text: str,
+        rag_provider: str,
     ) -> Optional[SupervisorPlan]:
         plan = manual_plan or self._load_plan_file(issue_id)
         guidelines = f"{self.guidelines}\n\nAPPROVED LEARNED RULES:\n{active_rules_text}"
@@ -767,6 +824,7 @@ class ReleaseArcOrchestrator:
                     "repo_path": str(self.source_repo),
                     "repo_context": repo_context,
                     "discovery_report": discovery_report,
+                    "rag_provider": rag_provider,
                 },
                 issue_description,
             )
@@ -793,6 +851,7 @@ class ReleaseArcOrchestrator:
                     "repo_path": str(self.source_repo),
                     "repo_context": repo_context,
                     "discovery_report": discovery_report,
+                    "rag_provider": rag_provider,
                 },
             )
             if not revision.success:
