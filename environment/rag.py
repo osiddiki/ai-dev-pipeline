@@ -17,10 +17,7 @@ class LiteLLMEmbeddingFunction(EmbeddingFunction):
             return [data["embedding"] for data in response.data]
         except Exception as e:
             logger.error("Embedding failed", error=str(e))
-            # Fallback to local default if API fails
-            from chromadb.utils import embedding_functions
-            default_ef = embedding_functions.DefaultEmbeddingFunction()
-            return default_ef(input)
+            raise RuntimeError(f"API Embedding failed: {str(e)}")
 
 class CodebaseRAG:
     def __init__(self, repo_path: str, model_id: str = "gemini/text-embedding-004"):
