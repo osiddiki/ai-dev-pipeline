@@ -33,7 +33,7 @@ class CodebaseRAG:
     def _get_files(self) -> list[Path]:
         files = []
         for root, dirs, filenames in os.walk(self.repo_path):
-            dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "dist", "build", ".gate_rag_cache", "__pycache__"}]
+            dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "dist", "build", ".gate_rag_cache", "__pycache__", ".venv", "venv", "env"}]
             for name in filenames:
                 if name.startswith(".") or name.endswith((".pyc", ".png", ".jpg", ".pdf")):
                     continue
@@ -67,7 +67,7 @@ class CodebaseRAG:
             except Exception:
                 continue
 
-        batch_size = 100
+        batch_size = 50
         for i in range(0, len(docs), batch_size):
             try:
                 self.collection.upsert(
@@ -75,8 +75,12 @@ class CodebaseRAG:
                     ids=ids[i:i+batch_size],
                     metadatas=metadatas[i:i+batch_size]
                 )
+                import time
+                time.sleep(2) # Respect Gemini API rate limits (15 RPM)
             except Exception as e:
                 logger.error("RAG upsert batch failed", error=str(e))
+                import time
+                time.sleep(10) # Backoff on failure
                 
         logger.info("RAG index built", total_chunks=len(docs))
 
