@@ -6,6 +6,8 @@ import json
 class CodebaseTools:
     def __init__(self, repo_path: str):
         self.repo_path = Path(repo_path).resolve()
+        from environment.rag import CodebaseRAG
+        self.rag = CodebaseRAG(str(self.repo_path))
 
     def _resolve_path(self, target_path: str) -> Path:
         target = (self.repo_path / target_path).resolve()
@@ -51,6 +53,10 @@ class CodebaseTools:
         except Exception as e:
             return f"Error searching: {str(e)}"
 
+    def semantic_code_search(self, query: str) -> str:
+        """Perform a semantic vector search across the entire codebase."""
+        return self.rag.search(query)
+
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
         if tool_name == "list_directory":
             return self.list_directory(arguments.get("path", "."))
@@ -58,6 +64,8 @@ class CodebaseTools:
             return self.read_file_content(arguments.get("path", ""))
         elif tool_name == "search_codebase":
             return self.search_codebase(arguments.get("query", ""), arguments.get("path", "."))
+        elif tool_name == "semantic_code_search":
+            return self.semantic_code_search(arguments.get("query", ""))
         else:
             return f"Error: Unknown tool '{tool_name}'"
 
@@ -99,6 +107,20 @@ SUPERVISOR_TOOLS_SCHEMA = [
                 "properties": {
                     "query": {"type": "string", "description": "The string to search for."},
                     "path": {"type": "string", "description": "Relative path to limit the search (defaults to '.')."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_code_search",
+            "description": "Perform a semantic vector search across the entire codebase to find relevant code chunks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "A natural language query (e.g., 'Where is the database connection established?')."}
                 },
                 "required": ["query"]
             }

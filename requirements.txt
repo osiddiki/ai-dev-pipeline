@@ -12,3 +12,4 @@ aiosqlite
 PyYAML
 aider-chat>=0.70.0
 mcp>=1.1.2
+chromadb>=0.4.0

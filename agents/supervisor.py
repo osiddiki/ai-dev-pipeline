@@ -40,6 +40,7 @@ class SupervisorAgent(BaseAgent):
         
         repo_path = context.get("repo_path", ".")
         tool_handler = CodebaseTools(repo_path)
+        tool_handler.rag.build_index()
         guidelines = context.get("guidelines", "Follow professional best practices.")
         
         system_prompt = f"""You are the Supervisor Agent for the GATE autonomous pipeline.
@@ -109,6 +110,7 @@ Your final response must be ONLY a valid JSON array of tasks matching this schem
         
         repo_path = context.get("repo_path", ".")
         tool_handler = CodebaseTools(repo_path)
+        tool_handler.rag.build_index()
         guidelines = context.get("guidelines", "Follow professional best practices.")
         
         system_prompt = f"""You are the Supervisor Agent.
