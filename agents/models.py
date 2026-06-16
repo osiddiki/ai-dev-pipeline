@@ -3,12 +3,12 @@ from pydantic import BaseModel
 
 class GateConfig(BaseModel):
     """Policy as Code for model hierarchy."""
-    executor_model: str = "deepseek/deepseek-chat"
-    verifier_model: str = "deepseek/deepseek-chat"
-    planner_model: str = "deepseek/deepseek-chat"
-    cheap_model: str = "deepseek/deepseek-chat"
-    strong_planner_model: str = "deepseek/deepseek-chat"
-    strong_verifier_model: str = "deepseek/deepseek-chat"
+    executor_model: str = "gemini/gemini-2.5-flash"
+    verifier_model: str = "gemini/gemini-2.5-flash"
+    planner_model: str = "gemini/gemini-2.5-flash"
+    cheap_model: str = "gemini/gemini-2.5-flash"
+    strong_planner_model: str = "gemini/gemini-2.5-pro"
+    strong_verifier_model: str = "gemini/gemini-2.5-pro"
     model_policy: Literal["policy_ladder", "best_always", "cost_first"] = "policy_ladder"
     rule_mode: Literal["review_first", "auto_apply", "local_only"] = "review_first"
     max_plan_repairs: int = 2
@@ -18,6 +18,7 @@ class GateConfig(BaseModel):
     max_task_attempts: int = 3
     allow_dependency_install: bool = True
     protect_gate_source_paths: bool = True
+    gemini_safety_mode: Literal["default", "block_none"] = "default"
 
 class GateReviewReport(BaseModel):
     """Structured output for all Gatekeeper reviews."""

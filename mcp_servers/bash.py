@@ -24,4 +24,6 @@ def execute_command(command: str, cwd: str = ".") -> str:
         return json.dumps({"output": f"Exception: {str(e)}", "exit_code": 1})
 
 if __name__ == "__main__":
+    import logging
+    logging.getLogger("mcp").setLevel(logging.WARNING)
     mcp.run()

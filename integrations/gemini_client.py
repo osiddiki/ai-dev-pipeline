@@ -1,6 +1,6 @@
 import os
+
 from litellm import acompletion
-import litellm
 import structlog
 from dotenv import load_dotenv
 
@@ -9,6 +9,10 @@ logger = structlog.get_logger()
 
 class LLMClient:
     """Wrapper for LLM interactions via LiteLLM supporting multiple providers."""
+
+    @classmethod
+    def _gemini_safety_mode(cls) -> str:
+        return os.environ.get("GATE_GEMINI_SAFETY_MODE", "default").strip().lower()
 
     @classmethod
     async def chat(cls, model_id: str, messages: list[dict], temperature: float = 0.3, response_format=None, tools=None):
@@ -27,13 +31,14 @@ class LLMClient:
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": 8192,
-                "safety_settings": [
+            }
+            if model_id.startswith("gemini/") and cls._gemini_safety_mode() == "block_none":
+                kwargs["safety_settings"] = [
                     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
                     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
                     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
                 ]
-            }
             # Inject the Pydantic schema directly into the prompt so any model can follow it
             if response_format:
                 schema_str = response_format.schema_json() if hasattr(response_format, "schema_json") else str(response_format)

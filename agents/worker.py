@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 
 class WorkerResult(BaseModel):
-    """Implementation evidence produced by the Codex worker."""
+    """Implementation evidence produced by the active worker agent."""
 
     task_id: str
     diff: str
