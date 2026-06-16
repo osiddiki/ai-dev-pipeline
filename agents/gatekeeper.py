@@ -41,7 +41,17 @@ class GatekeeperAgent(BaseAgent):
     def _parse_response(self, raw_response: str, metrics: dict[str, int] = {}) -> GateResult:
         """Extract data from the Gatekeeper's structured JSON response."""
         try:
-            report_data = json.loads(raw_response)
+            import re
+            clean_json = raw_response.strip()
+            match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', clean_json, re.DOTALL)
+            if match:
+                clean_json = match.group(1)
+            else:
+                clean_json = clean_json.replace("```json", "").replace("```", "").strip()
+                if '{' in clean_json and '}' in clean_json:
+                    clean_json = clean_json[clean_json.find('{'):clean_json.rfind('}')+1]
+
+            report_data = json.loads(clean_json)
             report = GateReviewReport(**report_data)
             
             critique = report.review_summary
