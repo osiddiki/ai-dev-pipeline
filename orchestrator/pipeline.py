@@ -12,7 +12,7 @@ from typing import List, Optional
 import structlog
 import yaml
 
-from agents.codex_worker import CodexWorkerAgent
+from agents.aider_worker import AiderWorkerAgent
 from agents.gatekeeper import GateResult, GatekeeperAgent
 from agents.meta_analyzer import MetaAnalyzerAgent
 from agents.models import GateConfig, VerificationResult
@@ -89,10 +89,10 @@ class ReleaseArcOrchestrator:
         self.guidelines = guidelines or "Follow professional best practices."
         self.config = config or GateConfig()
         self.supervisor = SupervisorAgent(model_id=self.config.planner_model)
-        self.worker = CodexWorkerAgent(
-            codex_command=self.config.codex_command,
-            sandbox=self.config.codex_sandbox,
-        )
+
+        self.worker = AiderWorkerAgent(model_id=self.config.executor_model)
+        GateUI.step("setup", f"Using Aider Agent Worker with {self.config.executor_model}")
+
         self.gatekeeper = GatekeeperAgent(model_id=self.config.verifier_model)
         self.researcher = ResearcherAgent(model_id=self.config.planner_model)
         self.meta_analyzer = MetaAnalyzerAgent(model_id=self.config.planner_model)
@@ -256,7 +256,8 @@ class ReleaseArcOrchestrator:
         prompt_rewrites = 0
 
         for attempt in range(1, self.config.max_task_attempts + 1):
-            self._reset_worktree(work_repo)
+            if attempt == 1:
+                self._reset_worktree(work_repo)
             await db.execute(
                 "UPDATE tasks SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE arc_id = ? AND task_id = ?",
                 (arc_id, task.id),
@@ -267,8 +268,9 @@ class ReleaseArcOrchestrator:
             self.supervisor.model_id = route.planner_model
             self.gatekeeper.model_id = route.verifier_model
 
-            GateUI.step("worker", f"Running Codex attempt {attempt}/{self.config.max_task_attempts}.")
+            GateUI.step("worker", f"Running Aider attempt {attempt}/{self.config.max_task_attempts}.")
             worker_context = {
+                "attempt": attempt,
                 "repo_path": str(work_repo),
                 "guidelines": self.guidelines,
                 "repo_context": repo_context,
@@ -277,6 +279,7 @@ class ReleaseArcOrchestrator:
                 "feedback": feedback,
                 "repair_brief": repair_brief,
                 "active_rules": active_rules_text,
+                "sandbox": DockerSandbox(str(work_repo)),
             }
             prompt = self.worker.build_prompt(worker_context, task)
             prompt_digest = prompt_hash(prompt)
@@ -678,7 +681,7 @@ class ReleaseArcOrchestrator:
 
     async def _get_or_create_arc(self, db, issue_id: str) -> int:
         async with db.execute(
-            "SELECT id FROM release_arcs WHERE issue_id = ? AND status != 'completed' ORDER BY id DESC LIMIT 1",
+            "SELECT id FROM release_arcs WHERE issue_id = ? AND status IN ('planning', 'in_progress') ORDER BY id DESC LIMIT 1",
             (issue_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -1169,7 +1172,11 @@ class ReleaseArcOrchestrator:
     def _changed_files(self, work_repo: Path) -> List[str]:
         tracked = self._git(work_repo, ["diff", "--name-only"]).splitlines()
         untracked = self._git(work_repo, ["ls-files", "--others", "--exclude-standard"]).splitlines()
-        return self._normalize_files(sorted({*tracked, *untracked}))
+        return [
+            path
+            for path in self._normalize_files(sorted({*tracked, *untracked}))
+            if not self._is_dependency_artifact(path)
+        ]
 
     def _changed_files_between(self, work_repo: Path, base: str, head: str) -> List[str]:
         output = self._git(work_repo, ["diff", "--name-only", f"{base}..{head}"])
@@ -1179,6 +1186,8 @@ class ReleaseArcOrchestrator:
         diff = self._git(work_repo, ["diff", "--no-ext-diff", "--binary"]).rstrip()
         chunks = [diff] if diff else []
         for rel_path in self._git(work_repo, ["ls-files", "--others", "--exclude-standard"]).splitlines():
+            if self._is_dependency_artifact(rel_path):
+                continue
             path = work_repo / rel_path
             if not path.is_file():
                 continue
@@ -1213,6 +1222,10 @@ class ReleaseArcOrchestrator:
                 continue
             normalized.append(path[2:] if path.startswith("./") else path)
         return sorted(set(normalized))
+
+    def _is_dependency_artifact(self, rel_path: str) -> bool:
+        parts = rel_path.split("/")
+        return "node_modules" in parts or "vendor" in parts and rel_path.endswith("/vendor")
 
     def _is_temp_artifact(self, rel_path: str) -> bool:
         name = os.path.basename(rel_path)

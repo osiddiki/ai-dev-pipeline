@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, List
 
@@ -14,20 +15,13 @@ from .worker import WorkerResult
 logger = structlog.get_logger()
 
 
-class CodexWorkerAgent(BaseAgent):
-    """Worker backend that delegates implementation to Codex CLI."""
+class AiderWorkerAgent(BaseAgent):
+    """Worker backend that delegates implementation to Aider CLI."""
 
-    name = "codex_worker"
+    name = "aider_worker"
 
-    def __init__(
-        self,
-        model_id: str = "codex-cli",
-        codex_command: str = "codex",
-        sandbox: str = "workspace-write",
-    ):
+    def __init__(self, model_id: str = "gemini/gemini-2.5-pro"):
         super().__init__(model_id=model_id)
-        self.codex_command = codex_command
-        self.sandbox = sandbox
 
     async def invoke(
         self,
@@ -38,38 +32,59 @@ class CodexWorkerAgent(BaseAgent):
         repo_path = Path(context.get("repo_path", ".")).resolve()
         prompt = self.build_prompt(context, input_data)
 
-        logger.info("Codex worker executing task", task_id=input_data.id, repo=str(repo_path))
+        logger.info("Aider worker executing task", task_id=input_data.id, repo=str(repo_path), model=self.model_id)
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+            f.write(prompt)
+            prompt_file = f.name
 
         try:
+            cmd = [
+                "aider",
+                "--model", self.model_id,
+                "--message-file", prompt_file,
+                "--yes",
+                "--no-auto-commits",
+            ]
+            
+            for allowed_file in input_data.allowed_files:
+                file_path = repo_path / allowed_file
+                if file_path.exists() or not file_path.parent.exists():
+                    cmd.append(allowed_file)
+
+            env = os.environ.copy()
+
             proc = await asyncio.create_subprocess_exec(
-                self.codex_command,
-                "exec",
-                "--sandbox",
-                self.sandbox,
-                "--json",
-                prompt,
+                *cmd,
                 cwd=str(repo_path),
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout_b, stderr_b = await proc.communicate()
         except FileNotFoundError:
+            os.unlink(prompt_file)
             return AgentResult(
                 success=False,
-                output=f"Codex command not found: {self.codex_command}",
+                output=f"Aider command not found. Please ensure aider-chat is installed in the environment.",
                 confidence_score=0.0,
             )
+        finally:
+            if os.path.exists(prompt_file):
+                os.unlink(prompt_file)
 
         stdout = stdout_b.decode("utf-8", errors="replace")
         stderr = stderr_b.decode("utf-8", errors="replace")
-        final_message = self._extract_final_message(stdout) or stderr[-4000:]
+        
+        final_message = "Aider completed successfully." if proc.returncode == 0 else f"Aider failed with {proc.returncode}"
+        
         changed_files = self._changed_files(repo_path)
         diff = self._diff_with_untracked(repo_path, changed_files)
 
         if proc.returncode != 0:
             return AgentResult(
                 success=False,
-                output=f"Codex exited with {proc.returncode}: {final_message or stderr}",
+                output=f"Aider exited with {proc.returncode}:\n\n{stdout[-2000:]}\n{stderr[-2000:]}",
                 confidence_score=0.0,
             )
 
@@ -78,16 +93,27 @@ class CodexWorkerAgent(BaseAgent):
             output=WorkerResult(
                 task_id=input_data.id,
                 diff=diff,
-                linter_output="Codex completed. GATE deterministic verification is pending.",
+                linter_output="Aider completed. GATE deterministic verification is pending.",
                 changed_files=changed_files,
                 final_message=final_message,
             ),
         )
 
     def build_prompt(self, context: dict[str, Any], task: TaskDefinition) -> str:
-        allowed_files = task.allowed_files
+        attempt = context.get("attempt", 1)
         feedback = context.get("feedback", "")
         repair_brief = context.get("repair_brief", "")
+        
+        if attempt > 1:
+            return f"""The previous attempt failed. Please fix the following errors:
+
+{feedback}
+
+Repair brief for this attempt:
+{repair_brief}
+
+Make the smallest coherent change required to fix these issues. Do not run any package install commands."""
+
         active_rules = context.get("active_rules", "")
         issue = context.get("issue_description", "")
         guidelines = context.get("guidelines", "")
@@ -98,14 +124,8 @@ class CodexWorkerAgent(BaseAgent):
 Original mission:
 {issue}
 
-Task id:
-{task.id}
-
 Task description:
 {task.description}
-
-Allowed files:
-{json.dumps(allowed_files, indent=2)}
 
 Design constraints:
 {task.design_constraints}
@@ -122,33 +142,11 @@ Active learned rules:
 Technical discovery report:
 {discovery_report}
 
-Previous verifier feedback:
-{feedback or "None"}
-
-Repair brief for this attempt:
-{repair_brief or "None"}
-
 Rules:
-- Edit the repository directly.
-- Modify only the allowed files listed above. If the allowed file list is empty, make the smallest coherent change required by the task.
-- Do not commit changes.
-- Do not create .tmp, .bak, backup, conflict-marker, or scratch files.
+- Make the smallest coherent change required by the task.
 - Do not run package install commands unless the task explicitly requires dependency installation.
 - Prefer existing project conventions over new abstractions.
-- When complete, summarize changed files and checks you ran.
 """
-
-    def _extract_final_message(self, jsonl: str) -> str:
-        final_message = ""
-        for line in jsonl.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = event.get("item") or {}
-            if event.get("type") == "item.completed" and item.get("type") == "agent_message":
-                final_message = item.get("text", "") or final_message
-        return final_message
 
     def _run_git(self, repo_path: Path, args: List[str]) -> str:
         result = subprocess.run(

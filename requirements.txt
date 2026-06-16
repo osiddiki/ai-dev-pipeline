@@ -10,3 +10,4 @@ python-dotenv>=1.0.0
 httpx>=0.24.0
 aiosqlite
 PyYAML
+aider-chat>=0.70.0

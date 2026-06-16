@@ -3,10 +3,10 @@ from pydantic import BaseModel
 
 class GateConfig(BaseModel):
     """Policy as Code for model hierarchy."""
-    executor_model: str = "deepseek/deepseek-chat"
+    executor_model: str = "deepseek/deepseek-v4-pro"
     verifier_model: str = "gemini/gemini-3.1-pro-preview"
     planner_model: str = "gemini/gemini-2.5-pro"
-    cheap_model: str = "deepseek/deepseek-chat"
+    cheap_model: str = "deepseek/deepseek-v4-pro"
     strong_planner_model: str = "gemini/gemini-2.5-pro"
     strong_verifier_model: str = "gemini/gemini-3.1-pro-preview"
     model_policy: Literal["policy_ladder", "best_always", "cost_first"] = "policy_ladder"
@@ -14,8 +14,6 @@ class GateConfig(BaseModel):
     max_plan_repairs: int = 2
     max_prompt_rewrites: int = 3
     min_gate_confidence: float = 0.8
-    codex_command: str = "codex"
-    codex_sandbox: str = "workspace-write"
     use_git_worktree: bool = True
     max_task_attempts: int = 3
     allow_dependency_install: bool = True

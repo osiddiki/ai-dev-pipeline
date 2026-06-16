@@ -29,7 +29,7 @@ class DockerSandbox:
             print("!"*60 + "\n")
             sys.exit(1)
         
-        self.target_repo_path = Path(target_repo_path).absolute()
+        self.target_repo_path = Path(target_repo_path).resolve()
         self.container_workspace = "/workspace"
         self.image = image
         
