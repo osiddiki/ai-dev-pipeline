@@ -46,6 +46,12 @@ class CodebaseRAG:
         
         logger.info("Building RAG index...")
         files = self._get_files()
+        
+        docs = []
+        ids = []
+        metadatas = []
+        
+        for f in files:
             try:
                 content = f.read_text(encoding="utf-8")
                 lines = content.split('\n')
