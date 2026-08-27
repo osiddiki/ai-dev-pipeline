@@ -4,7 +4,7 @@ This guide outlines exactly how the modern GATE pipeline processes an issue, fro
 
 ## 1. Initialization & Isolation
 The pipeline begins when you execute:
-`python -m orchestrator.main --repo /path/to/repo --issue "Fix the auth bug"`
+`python run_generator.py --repo /path/to/repo --issue-id "fix-auth-bug" --description "Fix the auth bug"`
 
 The very first action GATE takes is to create a secure **Git Worktree**. This guarantees that all AI agent experiments and file modifications happen in complete isolation and will never disrupt your active branch.
 
